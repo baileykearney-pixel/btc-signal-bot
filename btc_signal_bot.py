@@ -33,50 +33,48 @@ log = logging.getLogger("BTCBot")
 # ─── BINANCE DATA FETCHER ─────────────────────────────────────────────────────
 
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
-    """Fetch OHLCV candles from CoinGecko — no geo-blocks, no auth needed."""
+    """Fetch OHLCV candles from Kraken — free, no auth, no geo-blocks."""
     try:
-        chart_url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
-        params = {"vs_currency": "usd", "days": "1", "interval": "minute"}
-        r = requests.get(chart_url, params=params, timeout=15,
+        # Kraken uses XBT instead of BTC; interval in minutes
+        url = "https://api.kraken.com/0/public/OHLC"
+        params = {"pair": "XBTUSD", "interval": 1}
+        r = requests.get(url, params=params, timeout=15,
                          headers={"User-Agent": "btc-signal-bot/1.0"})
         r.raise_for_status()
         data = r.json()
-        prices = data.get("prices", [])
-        volumes = data.get("total_volumes", [])
-        if not prices:
+        if data.get("error"):
+            log.warning(f"Kraken error: {data['error']}")
             return []
-        vol_map = {v[0]: v[1] for v in volumes}
-        bucket_ms = 60_000
-        buckets = {}
-        for ts, price in prices:
-            key = (ts // bucket_ms) * bucket_ms
-            if key not in buckets:
-                buckets[key] = {"open": price, "high": price, "low": price,
-                                "close": price, "vol": vol_map.get(ts, 0)}
-            else:
-                buckets[key]["high"] = max(buckets[key]["high"], price)
-                buckets[key]["low"]  = min(buckets[key]["low"], price)
-                buckets[key]["close"] = price
-                buckets[key]["vol"] += vol_map.get(ts, 0)
+        # Result key is the pair name (XXBTZUSD or similar)
+        result = data.get("result", {})
+        pair_key = [k for k in result if k != "last"][0]
+        raw = result[pair_key]
         candles = []
-        for ts_key in sorted(buckets.keys())[-limit:]:
-            b = buckets[ts_key]
-            candles.append({"ts": ts_key, "open": b["open"], "high": b["high"],
-                            "low": b["low"], "close": b["close"], "vol": b["vol"]})
+        for c in raw[-limit:]:
+            candles.append({
+                "ts":    int(c[0]) * 1000,
+                "open":  float(c[1]),
+                "high":  float(c[2]),
+                "low":   float(c[3]),
+                "close": float(c[4]),
+                "vol":   float(c[6]),
+            })
         return candles
     except Exception as e:
-        log.warning(f"CoinGecko fetch error: {e}")
+        log.warning(f"Kraken fetch error: {e}")
         return []
 
 def fetch_ticker(symbol: str) -> float | None:
-    """Get latest BTC price from CoinGecko."""
+    """Get latest BTC price from Kraken."""
     try:
         r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            "https://api.kraken.com/0/public/Ticker",
+            params={"pair": "XBTUSD"},
             headers={"User-Agent": "btc-signal-bot/1.0"}, timeout=5
         )
-        return float(r.json()["bitcoin"]["usd"])
+        result = r.json().get("result", {})
+        pair_key = list(result.keys())[0]
+        return float(result[pair_key]["c"][0])
     except Exception:
         return None
 
@@ -666,3 +664,4 @@ if __name__ == "__main__":
         return best
 
     run()
+
