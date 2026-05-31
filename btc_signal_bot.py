@@ -33,41 +33,53 @@ log = logging.getLogger("BTCBot")
 # ─── BINANCE DATA FETCHER ─────────────────────────────────────────────────────
 
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
-    """Fetch OHLCV candles from Bybit public API (no auth needed, no geo-blocks)."""
-    url = "https://api.bybit.com/v5/market/kline"
-    # Bybit interval format: 1 = 1min, 5 = 5min, etc.
-    bybit_interval = interval.replace("m", "").replace("h", "60").replace("d", "D")
-    params = {"category": "spot", "symbol": symbol, "interval": bybit_interval, "limit": limit}
+    """Fetch OHLCV candles from CoinGecko — no geo-blocks, no auth needed."""
     try:
-        r = requests.get(url, params=params, timeout=10)
+        chart_url = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart"
+        params = {"vs_currency": "usd", "days": "1", "interval": "minute"}
+        r = requests.get(chart_url, params=params, timeout=15,
+                         headers={"User-Agent": "btc-signal-bot/1.0"})
         r.raise_for_status()
         data = r.json()
-        raw = data.get("result", {}).get("list", [])
+        prices = data.get("prices", [])
+        volumes = data.get("total_volumes", [])
+        if not prices:
+            return []
+        vol_map = {v[0]: v[1] for v in volumes}
+        bucket_ms = 60_000
+        buckets = {}
+        for ts, price in prices:
+            key = (ts // bucket_ms) * bucket_ms
+            if key not in buckets:
+                buckets[key] = {"open": price, "high": price, "low": price,
+                                "close": price, "vol": vol_map.get(ts, 0)}
+            else:
+                buckets[key]["high"] = max(buckets[key]["high"], price)
+                buckets[key]["low"]  = min(buckets[key]["low"], price)
+                buckets[key]["close"] = price
+                buckets[key]["vol"] += vol_map.get(ts, 0)
         candles = []
-        for c in reversed(raw):  # Bybit returns newest first
-            candles.append({
-                "ts":    int(c[0]),
-                "open":  float(c[1]),
-                "high":  float(c[2]),
-                "low":   float(c[3]),
-                "close": float(c[4]),
-                "vol":   float(c[5]),
-            })
+        for ts_key in sorted(buckets.keys())[-limit:]:
+            b = buckets[ts_key]
+            candles.append({"ts": ts_key, "open": b["open"], "high": b["high"],
+                            "low": b["low"], "close": b["close"], "vol": b["vol"]})
         return candles
     except Exception as e:
-        log.warning(f"Bybit fetch error: {e}")
+        log.warning(f"CoinGecko fetch error: {e}")
         return []
 
 def fetch_ticker(symbol: str) -> float | None:
-    """Get latest price from Bybit."""
+    """Get latest BTC price from CoinGecko."""
     try:
         r = requests.get(
-            "https://api.bybit.com/v5/market/tickers",
-            params={"category": "spot", "symbol": symbol}, timeout=5
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"},
+            headers={"User-Agent": "btc-signal-bot/1.0"}, timeout=5
         )
-        return float(r.json()["result"]["list"][0]["lastPrice"])
+        return float(r.json()["bitcoin"]["usd"])
     except Exception:
         return None
+
 
 # ─── INDICATORS ───────────────────────────────────────────────────────────────
 
@@ -654,4 +666,3 @@ if __name__ == "__main__":
         return best
 
     run()
-
