@@ -33,15 +33,18 @@ log = logging.getLogger("BTCBot")
 # ─── BINANCE DATA FETCHER ─────────────────────────────────────────────────────
 
 def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
-    """Fetch OHLCV candles from Binance public API (no auth needed)."""
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    """Fetch OHLCV candles from Bybit public API (no auth needed, no geo-blocks)."""
+    url = "https://api.bybit.com/v5/market/kline"
+    # Bybit interval format: 1 = 1min, 5 = 5min, etc.
+    bybit_interval = interval.replace("m", "").replace("h", "60").replace("d", "D")
+    params = {"category": "spot", "symbol": symbol, "interval": bybit_interval, "limit": limit}
     try:
         r = requests.get(url, params=params, timeout=10)
         r.raise_for_status()
-        raw = r.json()
+        data = r.json()
+        raw = data.get("result", {}).get("list", [])
         candles = []
-        for c in raw:
+        for c in reversed(raw):  # Bybit returns newest first
             candles.append({
                 "ts":    int(c[0]),
                 "open":  float(c[1]),
@@ -52,17 +55,17 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
             })
         return candles
     except Exception as e:
-        log.warning(f"Binance fetch error: {e}")
+        log.warning(f"Bybit fetch error: {e}")
         return []
 
 def fetch_ticker(symbol: str) -> float | None:
-    """Get latest mark price."""
+    """Get latest price from Bybit."""
     try:
         r = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": symbol}, timeout=5
+            "https://api.bybit.com/v5/market/tickers",
+            params={"category": "spot", "symbol": symbol}, timeout=5
         )
-        return float(r.json()["price"])
+        return float(r.json()["result"]["list"][0]["lastPrice"])
     except Exception:
         return None
 
@@ -651,3 +654,4 @@ if __name__ == "__main__":
         return best
 
     run()
+
