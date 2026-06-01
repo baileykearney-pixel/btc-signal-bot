@@ -1,27 +1,33 @@
 """
-BTC Signal Bot — AI-powered Bitcoin trading signal detector
-Runs 24/7, analyses price data, sends Telegram notifications on high-confidence setups.
+BTC Signal Bot v3 — Dual timeframe, volume-confirmed, structure-based signals
+- 1H chart sets the trend bias
+- 5-min chart finds the entry at key S/R levels
+- Volume must confirm every signal
+- TP at next S/R level, SL behind real structure
 """
 
 import time
 import logging
 import os
-import json
 import math
 from datetime import datetime, timezone
 from collections import deque
 import requests
 
-# ─── CONFIG (set via environment variables) ──────────────────────────────────
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+# ─── CONFIG ──────────────────────────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-SYMBOL = "BTCUSDT"
-INTERVAL = "5"
-LOOKBACK_CANDLES = 200       # candles kept in memory
-FETCH_INTERVAL_SEC = 180      # how often to fetch new data
-MIN_CONFIDENCE = 68          # minimum confidence % to send alert
-COOLDOWN_SEC = 900           # minimum seconds between alerts (avoid spam)
+SYMBOL            = "XBTUSD"        # Kraken pair
+INTERVAL_HTF      = 60              # 1 hour candles for trend
+INTERVAL_LTF      = 5               # 5 min candles for entry
+LOOKBACK_HTF      = 100             # 1H candles to keep
+LOOKBACK_LTF      = 200             # 5min candles to keep
+FETCH_INTERVAL    = 120             # check every 2 minutes
+MIN_CONFIDENCE    = 70              # minimum confidence to alert
+COOLDOWN_SEC      = 900             # 15 min between alerts
+MIN_VOL_MULT      = 1.4             # volume must be 1.4x average to confirm
+SR_ZONE_PCT       = 0.0015          # price must be within 0.15% of S/R level
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,26 +36,26 @@ logging.basicConfig(
 )
 log = logging.getLogger("BTCBot")
 
-# ─── BINANCE DATA FETCHER ─────────────────────────────────────────────────────
+# ─── DATA FETCHING ────────────────────────────────────────────────────────────
 
-def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
-    """Fetch OHLCV candles from Kraken — free, no auth, no geo-blocks."""
+def fetch_kraken(interval: int, limit: int) -> list[dict]:
+    """Fetch OHLCV from Kraken. interval in minutes."""
     try:
-        # Kraken uses XBT instead of BTC; interval in minutes
-        url = "https://api.kraken.com/0/public/OHLC"
-        params = {"pair": "XBTUSD", "interval": 5}
-        r = requests.get(url, params=params, timeout=15,
-                         headers={"User-Agent": "btc-signal-bot/1.0"})
+        r = requests.get(
+            "https://api.kraken.com/0/public/OHLC",
+            params={"pair": SYMBOL, "interval": interval},
+            headers={"User-Agent": "btc-signal-bot/3.0"},
+            timeout=15
+        )
         r.raise_for_status()
         data = r.json()
         if data.get("error"):
             log.warning(f"Kraken error: {data['error']}")
             return []
-        # Result key is the pair name (XXBTZUSD or similar)
-        result = data.get("result", {})
+        result   = data.get("result", {})
         pair_key = [k for k in result if k != "last"][0]
-        raw = result[pair_key]
-        candles = []
+        raw      = result[pair_key]
+        candles  = []
         for c in raw[-limit:]:
             candles.append({
                 "ts":    int(c[0]) * 1000,
@@ -64,22 +70,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
         log.warning(f"Kraken fetch error: {e}")
         return []
 
-def fetch_ticker(symbol: str) -> float | None:
-    """Get latest BTC price from Kraken."""
-    try:
-        r = requests.get(
-            "https://api.kraken.com/0/public/Ticker",
-            params={"pair": "XBTUSD"},
-            headers={"User-Agent": "btc-signal-bot/1.0"}, timeout=5
-        )
-        result = r.json().get("result", {})
-        pair_key = list(result.keys())[0]
-        return float(result[pair_key]["c"][0])
-    except Exception:
-        return None
-
-
-# ─── INDICATORS ───────────────────────────────────────────────────────────────
+# ─── INDICATORS ──────────────────────────────────────────────────────────────
 
 def ema(values: list[float], period: int) -> list[float]:
     if len(values) < period:
@@ -90,578 +81,605 @@ def ema(values: list[float], period: int) -> list[float]:
         result.append(v * k + result[-1] * (1 - k))
     return result
 
-def sma(values: list[float], period: int) -> list[float]:
-    return [
-        sum(values[i:i+period]) / period
-        for i in range(len(values) - period + 1)
-    ]
-
-def rsi(closes: list[float], period: int = 14) -> list[float]:
+def rsi(closes: list[float], period: int = 14) -> float | None:
     if len(closes) < period + 1:
-        return []
+        return None
     deltas = [closes[i+1] - closes[i] for i in range(len(closes)-1)]
-    gains, losses = [], []
-    for d in deltas:
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_g = sum(gains[:period]) / period
-    avg_l = sum(losses[:period]) / period
-    result = []
+    gains  = [max(d, 0) for d in deltas]
+    losses = [max(-d, 0) for d in deltas]
+    avg_g  = sum(gains[:period]) / period
+    avg_l  = sum(losses[:period]) / period
     for i in range(period, len(deltas)):
         avg_g = (avg_g * (period - 1) + gains[i]) / period
         avg_l = (avg_l * (period - 1) + losses[i]) / period
-        rs = avg_g / avg_l if avg_l != 0 else 100
-        result.append(100 - 100 / (1 + rs))
-    return result
+    if avg_l == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_g / avg_l)
 
-def atr(candles: list[dict], period: int = 14) -> list[float]:
+def atr(candles: list[dict], period: int = 14) -> float | None:
+    if len(candles) < period + 1:
+        return None
     trs = []
     for i in range(1, len(candles)):
         h, l, pc = candles[i]["high"], candles[i]["low"], candles[i-1]["close"]
         trs.append(max(h - l, abs(h - pc), abs(l - pc)))
-    if len(trs) < period:
-        return []
     avgs = [sum(trs[:period]) / period]
     for tr in trs[period:]:
         avgs.append((avgs[-1] * (period - 1) + tr) / period)
-    return avgs
+    return avgs[-1] if avgs else None
 
-def bollinger(closes: list[float], period: int = 20, num_std: float = 2.0):
-    if len(closes) < period:
-        return [], [], []
-    mid = sma(closes, period)
-    upper, lower = [], []
-    for i in range(len(mid)):
-        window = closes[i:i+period]
-        std = math.sqrt(sum((x - mid[i])**2 for x in window) / period)
-        upper.append(mid[i] + num_std * std)
-        lower.append(mid[i] - num_std * std)
-    return upper, mid, lower
+def avg_volume(candles: list[dict], period: int = 20) -> float:
+    vols = [c["vol"] for c in candles[-period-1:-1]]
+    return sum(vols) / len(vols) if vols else 1.0
 
-def macd(closes: list[float], fast=12, slow=26, signal=9):
-    e_fast = ema(closes, fast)
-    e_slow = ema(closes, slow)
-    diff = len(e_fast) - len(e_slow)
-    macd_line = [e_fast[i+diff] - e_slow[i] for i in range(len(e_slow))]
-    sig_line = ema(macd_line, signal)
-    hist_diff = len(macd_line) - len(sig_line)
-    histogram = [macd_line[i+hist_diff] - sig_line[i] for i in range(len(sig_line))]
-    return macd_line, sig_line, histogram
+# ─── HIGHER TIMEFRAME TREND ───────────────────────────────────────────────────
 
-def pivot_highs(highs: list[float], window: int = 5) -> list[tuple[int, float]]:
-    pivots = []
+def get_htf_bias(htf_candles: list[dict]) -> str:
+    """
+    Returns 'BULL', 'BEAR', or 'NEUTRAL' based on 1H chart structure.
+    Uses EMA20/EMA50 alignment + price position + recent swing structure.
+    """
+    if len(htf_candles) < 55:
+        return "NEUTRAL"
+    closes = [c["close"] for c in htf_candles]
+    e20    = ema(closes, 20)
+    e50    = ema(closes, 50)
+    if not e20 or not e50:
+        return "NEUTRAL"
+
+    price  = closes[-1]
+    # EMA alignment
+    ema_bull = e20[-1] > e50[-1]
+    ema_bear = e20[-1] < e50[-1]
+    # Price above/below EMAs
+    above_both = price > e20[-1] and price > e50[-1]
+    below_both = price < e20[-1] and price < e50[-1]
+    # Recent higher highs / lower lows (last 10 candles vs prior 10)
+    recent_high = max(c["high"] for c in htf_candles[-10:])
+    prior_high  = max(c["high"] for c in htf_candles[-20:-10])
+    recent_low  = min(c["low"]  for c in htf_candles[-10:])
+    prior_low   = min(c["low"]  for c in htf_candles[-20:-10])
+    hh_hl = recent_high > prior_high and recent_low > prior_low
+    lh_ll = recent_high < prior_high and recent_low < prior_low
+
+    bull_score = sum([ema_bull, above_both, hh_hl])
+    bear_score = sum([ema_bear, below_both, lh_ll])
+
+    if bull_score >= 2:
+        return "BULL"
+    elif bear_score >= 2:
+        return "BEAR"
+    return "NEUTRAL"
+
+# ─── KEY S/R LEVELS FROM 1H ──────────────────────────────────────────────────
+
+def get_key_levels(htf_candles: list[dict]) -> list[float]:
+    """
+    Find key S/R levels from 1H swing highs and lows.
+    Returns sorted list of price levels.
+    """
+    if len(htf_candles) < 20:
+        return []
+    highs  = [c["high"] for c in htf_candles]
+    lows   = [c["low"]  for c in htf_candles]
+    levels = []
+    window = 5
+    # Swing highs
     for i in range(window, len(highs) - window):
         if highs[i] == max(highs[i-window:i+window+1]):
-            pivots.append((i, highs[i]))
-    return pivots
-
-def pivot_lows(lows: list[float], window: int = 5) -> list[tuple[int, float]]:
-    pivots = []
+            levels.append(highs[i])
+    # Swing lows
     for i in range(window, len(lows) - window):
         if lows[i] == min(lows[i-window:i+window+1]):
-            pivots.append((i, lows[i]))
-    return pivots
+            levels.append(lows[i])
+    # Cluster nearby levels (within 0.2%)
+    levels.sort()
+    clustered = []
+    for lvl in levels:
+        if not clustered or abs(lvl - clustered[-1]) / clustered[-1] > 0.002:
+            clustered.append(lvl)
+        else:
+            clustered[-1] = (clustered[-1] + lvl) / 2  # average the cluster
+    return clustered
 
-def volume_profile(candles: list[dict], bins: int = 20) -> dict:
-    """Simple volume-at-price distribution."""
-    all_lows = [c["low"] for c in candles]
-    all_highs = [c["high"] for c in candles]
-    price_min, price_max = min(all_lows), max(all_highs)
-    bin_size = (price_max - price_min) / bins
-    profile = {}
-    for c in candles:
-        mid = (c["high"] + c["low"]) / 2
-        b = int((mid - price_min) / bin_size)
-        b = min(b, bins - 1)
-        profile[b] = profile.get(b, 0) + c["vol"]
-    # find POC (point of control = highest volume bin)
-    poc_bin = max(profile, key=profile.get)
-    poc_price = price_min + (poc_bin + 0.5) * bin_size
-    return {"poc": poc_price, "profile": profile,
-            "price_min": price_min, "price_max": price_max, "bin_size": bin_size}
+def nearest_levels(price: float, levels: list[float], direction: str) -> tuple[float | None, float | None]:
+    """
+    Returns (nearest_level_below, nearest_level_above) relative to price.
+    Used to set TP at next S/R and SL behind structure.
+    """
+    below = [l for l in levels if l < price * 0.9995]
+    above = [l for l in levels if l > price * 1.0005]
+    nearest_below = max(below) if below else None
+    nearest_above = min(above) if above else None
+    return nearest_below, nearest_above
 
-# ─── STRATEGY ENGINES ────────────────────────────────────────────────────────
-
-def strategy_breakout(candles, atr_vals, closes, highs, lows) -> dict | None:
-    """Detects breakouts above key resistance or below key support."""
-    if len(candles) < 50 or len(atr_vals) < 1:
-        return None
-    recent = candles[-50:]
-    # consolidation: check if price was ranging in a tight band
-    r_highs = [c["high"] for c in recent[:-3]]
-    r_lows  = [c["low"]  for c in recent[:-3]]
-    band = max(r_highs) - min(r_lows)
-    current_atr = atr_vals[-1]
-    if band < current_atr * 4:
-        return None  # not a valid consolidation (too tight or no range)
-
-    resistance = max(r_highs)
-    support    = min(r_lows)
-    last_close = closes[-1]
-    last_vol   = candles[-1]["vol"]
-    avg_vol    = sum(c["vol"] for c in candles[-20:-1]) / 19
-
-    # Bullish breakout
-    if last_close > resistance and last_vol > avg_vol * 1.3:
-        conf = min(90, 55 + int((last_close - resistance) / current_atr * 15) +
-                   int(min(last_vol / avg_vol - 1, 1) * 15))
-        tp = last_close + band * 0.618
-        sl = resistance - current_atr * 0.5
-        return {"direction": "LONG", "strategy": "Consolidation Breakout",
-                "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Broke ${resistance:,.0f} resistance with {last_vol/avg_vol:.1f}x volume"}
-
-    # Bearish breakdown
-    if last_close < support and last_vol > avg_vol * 1.3:
-        conf = min(90, 55 + int((support - last_close) / current_atr * 15) +
-                   int(min(last_vol / avg_vol - 1, 1) * 15))
-        tp = last_close - band * 0.618
-        sl = support + current_atr * 0.5
-        return {"direction": "SHORT", "strategy": "Consolidation Breakdown",
-                "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Broke ${support:,.0f} support with {last_vol/avg_vol:.1f}x volume"}
+def price_at_sr_zone(price: float, levels: list[float]) -> float | None:
+    """Returns the S/R level if price is within SR_ZONE_PCT of it, else None."""
+    for lvl in levels:
+        if abs(price - lvl) / lvl <= SR_ZONE_PCT:
+            return lvl
     return None
 
-def strategy_trend_pullback(candles, closes, atr_vals) -> dict | None:
-    """Buy pullbacks in uptrend; sell bounces in downtrend."""
-    if len(closes) < 60 or len(atr_vals) < 1:
+# ─── 5-MIN ENTRY STRATEGIES ──────────────────────────────────────────────────
+
+def strategy_sr_rejection(ltf_candles, closes, highs, lows, atr_val,
+                           avg_vol, sr_level, bias) -> dict | None:
+    """
+    Price touches a key S/R level and rejects with a confirmation candle.
+    Only trades in direction of HTF bias.
+    """
+    if len(ltf_candles) < 10 or not atr_val:
         return None
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
-    if len(ema20) < 5 or len(ema50) < 5:
-        return None
-    trend_up   = ema20[-1] > ema50[-1] and ema20[-3] > ema50[-3]
-    trend_down = ema20[-1] < ema50[-1] and ema20[-3] < ema50[-3]
-    current_atr = atr_vals[-1]
-    last_close  = closes[-1]
-
-    rsi_vals = rsi(closes, 14)
-    if not rsi_vals:
-        return None
-
-    # Bullish pullback to EMA20
-    if trend_up:
-        dist = abs(last_close - ema20[-1])
-        if dist < current_atr * 0.6 and 35 < rsi_vals[-1] < 55:
-            conf = 68 + min(12, int((55 - rsi_vals[-1]) / 5))
-            tp   = last_close + current_atr * 3.0
-            sl   = last_close - current_atr * 1.5
-            return {"direction": "LONG", "strategy": "Trend Pullback to EMA20",
-                    "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                    "note": f"EMA20={ema20[-1]:,.0f} | RSI={rsi_vals[-1]:.0f}"}
-
-    # Bearish bounce rejection
-    if trend_down:
-        dist = abs(last_close - ema20[-1])
-        if dist < current_atr * 0.6 and 45 < rsi_vals[-1] < 65:
-            conf = 68 + min(12, int((rsi_vals[-1] - 45) / 5))
-            tp   = last_close - current_atr * 3.0
-            sl   = last_close + current_atr * 1.5
-            return {"direction": "SHORT", "strategy": "Trend Bounce Rejection",
-                    "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                    "note": f"EMA20={ema20[-1]:,.0f} | RSI={rsi_vals[-1]:.0f}"}
-    return None
-
-def strategy_support_resistance_flip(candles, closes, highs, lows, atr_vals) -> dict | None:
-    """S/R flip: old resistance becomes support (bullish) or vice versa."""
-    if len(candles) < 80 or len(atr_vals) < 1:
-        return None
-    p_highs = pivot_highs(highs[-80:], 5)
-    p_lows  = pivot_lows(lows[-80:], 5)
-    last    = closes[-1]
-    current_atr = atr_vals[-1]
-    tolerance   = current_atr * 0.5
-
-    # Look for old resistance now acting as support
-    for _, ph in p_highs[-6:]:
-        if abs(last - ph) < tolerance and last > ph:
-            conf = 72
-            tp   = last + current_atr * 2.5
-            sl   = last - current_atr * 1.2
-            return {"direction": "LONG", "strategy": "S/R Flip (Resistance→Support)",
-                    "entry": last, "tp": tp, "sl": sl, "confidence": conf,
-                    "note": f"Old resistance ${ph:,.0f} flipped to support"}
-
-    # Look for old support now acting as resistance
-    for _, pl in p_lows[-6:]:
-        if abs(last - pl) < tolerance and last < pl:
-            conf = 72
-            tp   = last - current_atr * 2.5
-            sl   = last + current_atr * 1.2
-            return {"direction": "SHORT", "strategy": "S/R Flip (Support→Resistance)",
-                    "entry": last, "tp": tp, "sl": sl, "confidence": conf,
-                    "note": f"Old support ${pl:,.0f} flipped to resistance"}
-    return None
-
-def strategy_momentum_surge(candles, closes, atr_vals) -> dict | None:
-    """Strong momentum candle with volume confirmation."""
-    if len(candles) < 30 or len(atr_vals) < 3:
-        return None
-    last     = candles[-1]
-    prev     = candles[-2]
-    avg_vol  = sum(c["vol"] for c in candles[-20:-1]) / 19
-    current_atr = atr_vals[-1]
-    body     = abs(last["close"] - last["open"])
-    range_   = last["high"] - last["low"]
+    # Use the CLOSED candle (second to last) as confirmation
+    # Last candle may still be forming
+    confirm = ltf_candles[-2]
+    prev    = ltf_candles[-3]
+    last_vol = confirm["vol"]
+    body     = abs(confirm["close"] - confirm["open"])
+    range_   = confirm["high"] - confirm["low"]
     if range_ == 0:
         return None
     body_pct = body / range_
 
-    rsi_vals = rsi(closes, 14)
-    if not rsi_vals:
-        return None
+    # Bullish rejection off support (only in BULL or NEUTRAL bias)
+    if bias in ("BULL", "NEUTRAL"):
+        if (confirm["close"] > confirm["open"] and   # green candle
+                body_pct > 0.5 and                   # decent body
+                confirm["low"] <= sr_level * 1.001 and  # touched the level
+                confirm["close"] > sr_level and         # closed above it
+                last_vol > avg_vol * MIN_VOL_MULT):     # volume confirmed
+            conf  = 72 + min(10, int(body_pct * 10))
+            below, above = nearest_levels(confirm["close"],
+                                          [sr_level], "LONG")
+            tp = confirm["close"] + atr_val * 2.5
+            sl = min(confirm["low"], prev["low"]) - atr_val * 0.3
+            # cap
+            tp = min(tp, confirm["close"] * 1.03)
+            sl = max(sl, confirm["close"] * 0.985)
+            return {"direction": "LONG",
+                    "strategy": "S/R Level Rejection (Support)",
+                    "entry": confirm["close"], "tp": tp, "sl": sl,
+                    "confidence": conf,
+                    "note": f"Rejected off ${sr_level:,.0f} support | Vol {last_vol/avg_vol:.1f}x avg"}
 
-    # Bullish surge
-    if (last["close"] > last["open"] and
-            body_pct > 0.7 and
-            body > current_atr * 1.2 and
-            last["vol"] > avg_vol * 1.5 and
-            rsi_vals[-1] > 55):
-        conf = min(88, 60 + int(body_pct * 20) + int(min(last["vol"]/avg_vol - 1, 1.5) * 8))
-        tp   = last["close"] + body * 1.5
-        sl   = last["open"] - current_atr * 0.4
-        return {"direction": "LONG", "strategy": "Bullish Momentum Surge",
-                "entry": last["close"], "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Body {body_pct*100:.0f}% of range | {last['vol']/avg_vol:.1f}x volume"}
-
-    # Bearish surge
-    if (last["close"] < last["open"] and
-            body_pct > 0.7 and
-            body > current_atr * 1.2 and
-            last["vol"] > avg_vol * 1.5 and
-            rsi_vals[-1] < 45):
-        conf = min(88, 60 + int(body_pct * 20) + int(min(last["vol"]/avg_vol - 1, 1.5) * 8))
-        tp   = last["close"] - body * 1.5
-        sl   = last["open"] + current_atr * 0.4
-        return {"direction": "SHORT", "strategy": "Bearish Momentum Surge",
-                "entry": last["close"], "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Body {body_pct*100:.0f}% of range | {last['vol']/avg_vol:.1f}x volume"}
+    # Bearish rejection off resistance (only in BEAR or NEUTRAL bias)
+    if bias in ("BEAR", "NEUTRAL"):
+        if (confirm["close"] < confirm["open"] and   # red candle
+                body_pct > 0.5 and
+                confirm["high"] >= sr_level * 0.999 and
+                confirm["close"] < sr_level and
+                last_vol > avg_vol * MIN_VOL_MULT):
+            conf  = 72 + min(10, int(body_pct * 10))
+            tp = confirm["close"] - atr_val * 2.5
+            sl = max(confirm["high"], prev["high"]) + atr_val * 0.3
+            tp = max(tp, confirm["close"] * 0.97)
+            sl = min(sl, confirm["close"] * 1.015)
+            return {"direction": "SHORT",
+                    "strategy": "S/R Level Rejection (Resistance)",
+                    "entry": confirm["close"], "tp": tp, "sl": sl,
+                    "confidence": conf,
+                    "note": f"Rejected off ${sr_level:,.0f} resistance | Vol {last_vol/avg_vol:.1f}x avg"}
     return None
 
-def strategy_fakeout_reversal(candles, closes, highs, lows, atr_vals) -> dict | None:
-    """Detects fakeouts: price spikes past a key level then snaps back."""
-    if len(candles) < 50 or len(atr_vals) < 1:
+def strategy_breakout_retest(ltf_candles, closes, highs, lows, atr_val,
+                              avg_vol, sr_level, bias) -> dict | None:
+    """
+    Price breaks a key level, pulls back to retest it, then continues.
+    The retest is the entry — much higher probability than chasing the break.
+    """
+    if len(ltf_candles) < 15 or not atr_val:
         return None
-    recent_high = max(highs[-20:-1])
-    recent_low  = min(lows[-20:-1])
-    last = candles[-1]
-    prev = candles[-2]
-    current_atr = atr_vals[-1]
+    # Look at last 10 candles for the break, last 3 for the retest
+    recent_closes = closes[-10:]
+    confirm = ltf_candles[-2]
+    last_vol = confirm["vol"]
 
-    # Bull trap fakeout (spike above high, then closed back below)
-    if (prev["high"] > recent_high and
-            prev["close"] < recent_high and
-            last["close"] < prev["low"]):
-        conf = 74
-        tp   = last["close"] - current_atr * 2.5
-        sl   = prev["high"] + current_atr * 0.3
-        return {"direction": "SHORT", "strategy": "Bull Trap / Fakeout Short",
-                "entry": last["close"], "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Fakeout above ${recent_high:,.0f}, now rejected"}
+    # Bullish: price broke above level in last 10 candles, now retesting it
+    if bias in ("BULL", "NEUTRAL"):
+        broke_above = any(c > sr_level for c in recent_closes[:-3])
+        retesting   = abs(confirm["close"] - sr_level) / sr_level < 0.002
+        reclaimed   = confirm["close"] >= sr_level
+        if (broke_above and retesting and reclaimed and
+                last_vol > avg_vol * 1.2):
+            conf = 74
+            tp   = confirm["close"] + atr_val * 3.0
+            sl   = sr_level - atr_val * 0.5
+            tp   = min(tp, confirm["close"] * 1.025)
+            sl   = max(sl, confirm["close"] * 0.985)
+            return {"direction": "LONG",
+                    "strategy": "Breakout Retest (Bull)",
+                    "entry": confirm["close"], "tp": tp, "sl": sl,
+                    "confidence": conf,
+                    "note": f"Retesting broken level ${sr_level:,.0f} as support"}
 
-    # Bear trap fakeout (spike below low, then recovered)
-    if (prev["low"] < recent_low and
-            prev["close"] > recent_low and
-            last["close"] > prev["high"]):
-        conf = 74
-        tp   = last["close"] + current_atr * 2.5
-        sl   = prev["low"] - current_atr * 0.3
-        return {"direction": "LONG", "strategy": "Bear Trap / Fakeout Long",
-                "entry": last["close"], "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Fakeout below ${recent_low:,.0f}, now recovered"}
+    # Bearish: price broke below level, now retesting from below
+    if bias in ("BEAR", "NEUTRAL"):
+        broke_below = any(c < sr_level for c in recent_closes[:-3])
+        retesting   = abs(confirm["close"] - sr_level) / sr_level < 0.002
+        rejected    = confirm["close"] <= sr_level
+        if (broke_below and retesting and rejected and
+                last_vol > avg_vol * 1.2):
+            conf = 74
+            tp   = confirm["close"] - atr_val * 3.0
+            sl   = sr_level + atr_val * 0.5
+            tp   = max(tp, confirm["close"] * 0.975)
+            sl   = min(sl, confirm["close"] * 1.015)
+            return {"direction": "SHORT",
+                    "strategy": "Breakout Retest (Bear)",
+                    "entry": confirm["close"], "tp": tp, "sl": sl,
+                    "confidence": conf,
+                    "note": f"Retesting broken level ${sr_level:,.0f} as resistance"}
     return None
 
-def strategy_bollinger_squeeze(candles, closes, atr_vals) -> dict | None:
-    """Bollinger band squeeze followed by expansion = volatility breakout."""
-    if len(closes) < 40 or len(atr_vals) < 1:
+def strategy_volume_climax_reversal(ltf_candles, closes, atr_val,
+                                     avg_vol, bias) -> dict | None:
+    """
+    Massive volume spike with a wick rejection candle = exhaustion move.
+    Price likely to reverse. One of the highest probability setups.
+    """
+    if len(ltf_candles) < 20 or not atr_val:
         return None
-    upper, mid, lower = bollinger(closes, 20)
-    if len(upper) < 10:
+    confirm  = ltf_candles[-2]
+    prev     = ltf_candles[-3]
+    last_vol = confirm["vol"]
+    range_   = confirm["high"] - confirm["low"]
+    if range_ == 0:
         return None
-    current_atr = atr_vals[-1]
-    bw_now  = (upper[-1] - lower[-1]) / mid[-1]   # band width now
-    bw_prev = max((upper[-i] - lower[-i]) / mid[-i] for i in range(2, 11))
-    # Squeeze condition: band width was compressed; now expanding
-    if bw_prev < 0.015 or bw_now < bw_prev * 1.1:
-        return None
-    last_close = closes[-1]
-    # direction = momentum
-    if last_close > mid[-1] and last_close > closes[-3]:
-        conf = 67
-        tp   = upper[-1] + current_atr * 1.5
-        sl   = mid[-1] - current_atr * 0.5
-        return {"direction": "LONG", "strategy": "Bollinger Squeeze Breakout",
-                "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"BB width expanding from {bw_prev*100:.2f}% to {bw_now*100:.2f}%"}
-    if last_close < mid[-1] and last_close < closes[-3]:
-        conf = 67
-        tp   = lower[-1] - current_atr * 1.5
-        sl   = mid[-1] + current_atr * 0.5
-        return {"direction": "SHORT", "strategy": "Bollinger Squeeze Breakdown",
-                "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"BB width expanding from {bw_prev*100:.2f}% to {bw_now*100:.2f}%"}
+    upper_wick = confirm["high"] - max(confirm["open"], confirm["close"])
+    lower_wick = min(confirm["open"], confirm["close"]) - confirm["low"]
+    body       = abs(confirm["close"] - confirm["open"])
+
+    # Bearish exhaustion: big volume, large upper wick, small body
+    if (bias in ("BEAR", "NEUTRAL") and
+            last_vol > avg_vol * 2.0 and
+            upper_wick > body * 1.5 and
+            upper_wick > range_ * 0.4 and
+            confirm["close"] < confirm["open"]):
+        conf = 76
+        tp   = confirm["close"] - atr_val * 2.5
+        sl   = confirm["high"] + atr_val * 0.3
+        tp   = max(tp, confirm["close"] * 0.975)
+        sl   = min(sl, confirm["close"] * 1.015)
+        return {"direction": "SHORT",
+                "strategy": "Volume Climax Reversal (Bearish)",
+                "entry": confirm["close"], "tp": tp, "sl": sl,
+                "confidence": conf,
+                "note": f"Exhaustion wick with {last_vol/avg_vol:.1f}x volume — buyers trapped"}
+
+    # Bullish exhaustion: big volume, large lower wick, small body
+    if (bias in ("BULL", "NEUTRAL") and
+            last_vol > avg_vol * 2.0 and
+            lower_wick > body * 1.5 and
+            lower_wick > range_ * 0.4 and
+            confirm["close"] > confirm["open"]):
+        conf = 76
+        tp   = confirm["close"] + atr_val * 2.5
+        sl   = confirm["low"] - atr_val * 0.3
+        tp   = min(tp, confirm["close"] * 1.025)
+        sl   = max(sl, confirm["close"] * 0.985)
+        return {"direction": "LONG",
+                "strategy": "Volume Climax Reversal (Bullish)",
+                "entry": confirm["close"], "tp": tp, "sl": sl,
+                "confidence": conf,
+                "note": f"Exhaustion wick with {last_vol/avg_vol:.1f}x volume — sellers trapped"}
     return None
 
-def strategy_macd_divergence(candles, closes, atr_vals) -> dict | None:
-    """MACD histogram divergence — price makes new low/high but MACD doesn't."""
-    if len(closes) < 60 or len(atr_vals) < 1:
+def strategy_trend_continuation(ltf_candles, closes, atr_val,
+                                  avg_vol, bias) -> dict | None:
+    """
+    Strong trend move with pullback to EMA20, confirmed by volume on resumption.
+    Only trades WITH the HTF bias.
+    """
+    if len(ltf_candles) < 25 or not atr_val or bias == "NEUTRAL":
         return None
-    _, _, hist = macd(closes)
-    if len(hist) < 20:
+    e20      = ema(closes, 20)
+    if len(e20) < 3:
         return None
-    current_atr = atr_vals[-1]
-    last_close  = closes[-1]
+    confirm  = ltf_candles[-2]
+    last_vol = confirm["vol"]
+    price    = confirm["close"]
+    dist_pct = abs(price - e20[-2]) / e20[-2]
+    rsi_val  = rsi(closes[:-1], 14)
 
-    # Bullish divergence: lower price low, higher MACD low
-    if (closes[-1] < closes[-10] and
-            hist[-1] > hist[-10] and
-            hist[-1] < 0):
-        conf = 70
-        tp   = last_close + current_atr * 2.5
-        sl   = last_close - current_atr * 1.2
-        return {"direction": "LONG", "strategy": "MACD Bullish Divergence",
-                "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Price lower but MACD histogram recovering"}
+    if bias == "BULL":
+        # Price pulled back to EMA20, now bouncing with volume
+        if (dist_pct < 0.003 and
+                confirm["close"] > confirm["open"] and
+                confirm["close"] > e20[-2] and
+                last_vol > avg_vol * MIN_VOL_MULT and
+                rsi_val and 35 < rsi_val < 60):
+            conf = 73
+            tp   = price + atr_val * 3.0
+            sl   = min(confirm["low"], e20[-2]) - atr_val * 0.3
+            tp   = min(tp, price * 1.025)
+            sl   = max(sl, price * 0.985)
+            return {"direction": "LONG",
+                    "strategy": "Trend Continuation (EMA20 Bounce)",
+                    "entry": price, "tp": tp, "sl": sl,
+                    "confidence": conf,
+                    "note": f"EMA20 bounce in uptrend | RSI {rsi_val:.0f} | Vol {last_vol/avg_vol:.1f}x"}
 
-    # Bearish divergence: higher price high, lower MACD high
-    if (closes[-1] > closes[-10] and
-            hist[-1] < hist[-10] and
-            hist[-1] > 0):
-        conf = 70
-        tp   = last_close - current_atr * 2.5
-        sl   = last_close + current_atr * 1.2
-        return {"direction": "SHORT", "strategy": "MACD Bearish Divergence",
-                "entry": last_close, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"Price higher but MACD histogram weakening"}
+    if bias == "BEAR":
+        # Price pulled back up to EMA20, now rejecting with volume
+        if (dist_pct < 0.003 and
+                confirm["close"] < confirm["open"] and
+                confirm["close"] < e20[-2] and
+                last_vol > avg_vol * MIN_VOL_MULT and
+                rsi_val and 40 < rsi_val < 65):
+            conf = 73
+            tp   = price - atr_val * 3.0
+            sl   = max(confirm["high"], e20[-2]) + atr_val * 0.3
+            tp   = max(tp, price * 0.975)
+            sl   = min(sl, price * 1.015)
+            return {"direction": "SHORT",
+                    "strategy": "Trend Continuation (EMA20 Rejection)",
+                    "entry": price, "tp": tp, "sl": sl,
+                    "confidence": conf,
+                    "note": f"EMA20 rejection in downtrend | RSI {rsi_val:.0f} | Vol {last_vol/avg_vol:.1f}x"}
     return None
 
-def strategy_volume_poc_reaction(candles, closes, atr_vals) -> dict | None:
-    """Price reaction to volume Point of Control — high-probability magnet zone."""
-    if len(candles) < 100 or len(atr_vals) < 1:
+def strategy_momentum_breakout(ltf_candles, closes, highs, lows,
+                                 atr_val, avg_vol, bias) -> dict | None:
+    """
+    Strong momentum candle breaking out of a tight range with high volume.
+    Must align with HTF bias.
+    """
+    if len(ltf_candles) < 20 or not atr_val or bias == "NEUTRAL":
         return None
-    vp = volume_profile(candles[-100:])
-    poc  = vp["poc"]
-    last = closes[-1]
-    current_atr = atr_vals[-1]
-    dist = abs(last - poc)
-
-    if dist > current_atr * 0.8:
+    confirm  = ltf_candles[-2]
+    last_vol = confirm["vol"]
+    body     = abs(confirm["close"] - confirm["open"])
+    range_   = confirm["high"] - confirm["low"]
+    if range_ == 0:
         return None
+    body_pct = body / range_
 
-    rsi_vals = rsi(closes, 14)
-    if not rsi_vals:
-        return None
+    # Check if prior 10 candles were in a tight range (consolidation)
+    prior_range = max(highs[-12:-2]) - min(lows[-12:-2])
+    if prior_range > atr_val * 3:
+        return None  # not a tight consolidation
 
-    # Bouncing off POC upward
-    if last >= poc and rsi_vals[-1] < 55:
-        conf = 66
-        tp   = last + current_atr * 2.0
-        sl   = poc - current_atr * 1.0
-        return {"direction": "LONG", "strategy": "Volume POC Bounce",
-                "entry": last, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"POC at ${poc:,.0f} acting as support | RSI={rsi_vals[-1]:.0f}"}
+    if (bias == "BULL" and
+            confirm["close"] > confirm["open"] and
+            body_pct > 0.65 and
+            body > atr_val * 0.8 and
+            last_vol > avg_vol * 2.0):
+        conf = 75 + min(8, int(last_vol / avg_vol * 2))
+        tp   = confirm["close"] + atr_val * 3.0
+        sl   = confirm["low"] - atr_val * 0.3
+        tp   = min(tp, confirm["close"] * 1.025)
+        sl   = max(sl, confirm["close"] * 0.985)
+        return {"direction": "LONG",
+                "strategy": "Momentum Breakout (Bull)",
+                "entry": confirm["close"], "tp": tp, "sl": sl,
+                "confidence": conf,
+                "note": f"Range breakout | {last_vol/avg_vol:.1f}x vol | Body {body_pct*100:.0f}%"}
 
-    # Rejecting off POC downward
-    if last <= poc and rsi_vals[-1] > 45:
-        conf = 66
-        tp   = last - current_atr * 2.0
-        sl   = poc + current_atr * 1.0
-        return {"direction": "SHORT", "strategy": "Volume POC Rejection",
-                "entry": last, "tp": tp, "sl": sl, "confidence": conf,
-                "note": f"POC at ${poc:,.0f} acting as resistance | RSI={rsi_vals[-1]:.0f}"}
+    if (bias == "BEAR" and
+            confirm["close"] < confirm["open"] and
+            body_pct > 0.65 and
+            body > atr_val * 0.8 and
+            last_vol > avg_vol * 2.0):
+        conf = 75 + min(8, int(last_vol / avg_vol * 2))
+        tp   = confirm["close"] - atr_val * 3.0
+        sl   = confirm["high"] + atr_val * 0.3
+        tp   = max(tp, confirm["close"] * 0.975)
+        sl   = min(sl, confirm["close"] * 1.015)
+        return {"direction": "SHORT",
+                "strategy": "Momentum Breakout (Bear)",
+                "entry": confirm["close"], "tp": tp, "sl": sl,
+                "confidence": conf,
+                "note": f"Range breakdown | {last_vol/avg_vol:.1f}x vol | Body {body_pct*100:.0f}%"}
     return None
 
-# ─── SIGNAL AGGREGATOR ───────────────────────────────────────────────────────
+# ─── MAIN ANALYSIS ───────────────────────────────────────────────────────────
 
-ALL_STRATEGIES = [
-    strategy_breakout,
-    strategy_trend_pullback,
-    strategy_support_resistance_flip,
-    strategy_momentum_surge,
-    strategy_fakeout_reversal,
-    strategy_bollinger_squeeze,
-    strategy_macd_divergence,
-    strategy_volume_poc_reaction,
-]
-
-def analyse(candles: list[dict]) -> dict | None:
-    """Run all strategies; return highest-confidence signal, or None."""
-    if len(candles) < 60:
+def analyse(htf_candles: list[dict], ltf_candles: list[dict]) -> dict | None:
+    if len(htf_candles) < 55 or len(ltf_candles) < 25:
         return None
-    closes = [c["close"] for c in candles]
-    highs  = [c["high"]  for c in candles]
-    lows   = [c["low"]   for c in candles]
-    atr_v  = atr(candles, 14)
 
+    # 1. Get higher timeframe bias
+    bias = get_htf_bias(htf_candles)
+
+    # 2. Get key S/R levels from 1H
+    sr_levels = get_key_levels(htf_candles)
+
+    # 3. Prepare LTF data
+    closes = [c["close"] for c in ltf_candles]
+    highs  = [c["high"]  for c in ltf_candles]
+    lows   = [c["low"]   for c in ltf_candles]
+    atr_v  = atr(ltf_candles, 14)
+    avg_v  = avg_volume(ltf_candles, 20)
+    price  = closes[-2]  # use confirmed closed candle price
+
+    # 4. Find nearest S/R level to current price
+    sr_zone = price_at_sr_zone(price, sr_levels)
+
+    # 5. Run strategies
     results = []
-    for strat in ALL_STRATEGIES:
-        try:
-            sig = strat(candles, *[x for x in [closes, highs, lows, atr_v]
-                                    if True][:strat.__code__.co_argcount - 1])
-        except TypeError:
-            # strategies take different arg subsets — route correctly
-            sig = None
+
+    # S/R based strategies (only if price is at a level)
+    if sr_zone:
+        for strat in [strategy_sr_rejection, strategy_breakout_retest]:
             try:
-                n = strat.__code__.co_varnames[:strat.__code__.co_argcount]
-                kwargs = {}
-                mapping = {"candles": candles, "closes": closes,
-                           "highs": highs, "lows": lows, "atr_vals": atr_v}
-                kwargs = {k: mapping[k] for k in n if k in mapping}
-                sig = strat(**kwargs)
+                sig = strat(ltf_candles, closes, highs, lows,
+                            atr_v, avg_v, sr_zone, bias)
+                if sig and sig["confidence"] >= MIN_CONFIDENCE:
+                    results.append(sig)
             except Exception as e:
-                log.debug(f"Strategy {strat.__name__} error: {e}")
-        if sig and sig["confidence"] >= MIN_CONFIDENCE:
-            results.append(sig)
+                log.debug(f"{strat.__name__} error: {e}")
+
+    # Non-SR strategies (run always)
+    for strat in [strategy_volume_climax_reversal,
+                  strategy_trend_continuation,
+                  strategy_momentum_breakout]:
+        try:
+            sig = strat(ltf_candles, closes, atr_v, avg_v, bias)
+            if sig and sig["confidence"] >= MIN_CONFIDENCE:
+                results.append(sig)
+        except Exception as e:
+            log.debug(f"{strat.__name__} error: {e}")
 
     if not results:
         return None
+
     best = max(results, key=lambda x: x["confidence"])
-    # bonus if multiple strategies agree on direction
+
+    # Confluence bonus
     same_dir = [r for r in results if r["direction"] == best["direction"]]
     if len(same_dir) > 1:
         best["confidence"] = min(95, best["confidence"] + (len(same_dir) - 1) * 3)
-        best["confluence"] = [r["strategy"] for r in same_dir if r["strategy"] != best["strategy"]]
+        best["confluence"] = [r["strategy"] for r in same_dir
+                              if r["strategy"] != best["strategy"]]
+
+    best["htf_bias"] = bias
+    if sr_zone:
+        best["sr_level"] = sr_zone
     return best
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 
 def send_telegram(text: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured — printing signal instead:")
+        log.warning("Telegram not configured — printing signal:")
         print(text)
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
-        r = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML"
-        }, timeout=10)
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+            timeout=10
+        )
         return r.status_code == 200
     except Exception as e:
-        log.warning(f"Telegram send error: {e}")
+        log.warning(f"Telegram error: {e}")
         return False
 
-def format_signal(sig: dict, btc_price: float) -> str:
+def format_signal(sig: dict) -> str:
     arrow   = "🟢" if sig["direction"] == "LONG" else "🔴"
-    rr      = abs(sig["tp"] - sig["entry"]) / abs(sig["entry"] - sig["sl"])
+    rr      = abs(sig["tp"] - sig["entry"]) / max(abs(sig["entry"] - sig["sl"]), 1)
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     conf    = sig["confidence"]
     bars    = "█" * (conf // 10) + "░" * (10 - conf // 10)
+    bias_emoji = {"BULL": "📈", "BEAR": "📉", "NEUTRAL": "➡️"}.get(sig.get("htf_bias", ""), "")
 
     lines = [
         f"{arrow} <b>BTC {sig['direction']} SIGNAL</b>",
         f"",
         f"📊 <b>Strategy:</b> {sig['strategy']}",
+        f"{bias_emoji} <b>1H Trend:</b> {sig.get('htf_bias', 'N/A')}",
         f"🕐 <b>Time:</b> {now_str}",
         f"",
         f"💰 <b>Entry:</b>  ${sig['entry']:,.2f}",
-        f"🎯 <b>TP:</b>     ${sig['tp']:,.2f}  (+{abs(sig['tp']-sig['entry'])/sig['entry']*100:.2f}%)",
-        f"🛑 <b>SL:</b>     ${sig['sl']:,.2f}  (-{abs(sig['entry']-sig['sl'])/sig['entry']*100:.2f}%)",
+        f"🎯 <b>TP:</b>     ${sig['tp']:,.2f}  ({'+' if sig['tp'] > sig['entry'] else ''}{(sig['tp']-sig['entry'])/sig['entry']*100:.2f}%)",
+        f"🛑 <b>SL:</b>     ${sig['sl']:,.2f}  ({(sig['sl']-sig['entry'])/sig['entry']*100:.2f}%)",
         f"",
         f"⚖️  <b>R:R ratio:</b> 1 : {rr:.1f}",
         f"🔥 <b>Confidence:</b> {conf}%  {bars}",
     ]
+    if "sr_level" in sig:
+        lines += [f"📍 <b>Key level:</b> ${sig['sr_level']:,.0f}"]
     if "note" in sig:
         lines += [f"", f"📝 <i>{sig['note']}</i>"]
     if sig.get("confluence"):
-        lines += [f"✅ <b>Also confirmed by:</b> {', '.join(sig['confluence'])}"]
+        lines += [f"✅ <b>Confirmed by:</b> {', '.join(sig['confluence'])}"]
     lines += [f"", f"⚠️ <i>Not financial advice. DYOR.</i>"]
     return "\n".join(lines)
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
+def keep_alive():
+    from flask import Flask
+    from threading import Thread
+    app = Flask("")
+    @app.route("/")
+    def home():
+        return "BTC Signal Bot v3 running ✅"
+    t = Thread(target=lambda: app.run(host="0.0.0.0", port=8080))
+    t.daemon = True
+    t.start()
+
 def run():
     log.info("═" * 55)
-    log.info("  BTC Signal Bot starting up")
-    log.info(f"  Symbol: {SYMBOL}  |  Interval: {INTERVAL}")
+    log.info("  BTC Signal Bot v3")
+    log.info(f"  HTF: {INTERVAL_HTF}min  |  LTF: {INTERVAL_LTF}min")
     log.info(f"  Min confidence: {MIN_CONFIDENCE}%  |  Cooldown: {COOLDOWN_SEC}s")
     log.info("═" * 55)
 
-    if not TELEGRAM_TOKEN:
-        log.warning("⚠  TELEGRAM_TOKEN not set — signals will print to console only")
+    keep_alive()
 
-    last_alert_time = 0
-    candle_buffer: deque[dict] = deque(maxlen=LOOKBACK_CANDLES)
+    last_alert_time      = 0
+    last_signal_dir      = None
+    last_signal_price    = 0.0
+    htf_buffer: deque    = deque(maxlen=LOOKBACK_HTF)
+    ltf_buffer: deque    = deque(maxlen=LOOKBACK_LTF)
 
-    # prime the buffer
-    initial = fetch_klines(SYMBOL, INTERVAL, LOOKBACK_CANDLES)
-    candle_buffer.extend(initial)
-    log.info(f"Loaded {len(initial)} initial candles")
+    # Prime buffers
+    htf_init = fetch_kraken(INTERVAL_HTF, LOOKBACK_HTF)
+    ltf_init = fetch_kraken(INTERVAL_LTF, LOOKBACK_LTF)
+    htf_buffer.extend(htf_init)
+    ltf_buffer.extend(ltf_init)
+    log.info(f"Loaded {len(htf_init)} HTF + {len(ltf_init)} LTF candles")
 
     while True:
         try:
-            new_candles = fetch_klines(SYMBOL, INTERVAL, 5)
-            if new_candles:
-                # update / append latest candle
-                latest = new_candles[-1]
-                if candle_buffer and candle_buffer[-1]["ts"] == latest["ts"]:
-                    candle_buffer[-1] = latest
-                else:
-                    candle_buffer.append(latest)
+            # Refresh data
+            htf_new = fetch_kraken(INTERVAL_HTF, 5)
+            ltf_new = fetch_kraken(INTERVAL_LTF, 10)
 
-            candles = list(candle_buffer)
-            price   = candles[-1]["close"] if candles else 0.0
-            log.info(f"BTC ${price:,.2f}  |  candles={len(candles)}")
+            for c in htf_new:
+                if not htf_buffer or c["ts"] > htf_buffer[-1]["ts"]:
+                    htf_buffer.append(c)
+                elif c["ts"] == htf_buffer[-1]["ts"]:
+                    htf_buffer[-1] = c
+
+            for c in ltf_new:
+                if not ltf_buffer or c["ts"] > ltf_buffer[-1]["ts"]:
+                    ltf_buffer.append(c)
+                elif c["ts"] == ltf_buffer[-1]["ts"]:
+                    ltf_buffer[-1] = c
+
+            htf = list(htf_buffer)
+            ltf = list(ltf_buffer)
+            price = ltf[-1]["close"] if ltf else 0
+
+            bias = get_htf_bias(htf) if len(htf) >= 55 else "?"
+            log.info(f"BTC ${price:,.2f}  |  1H bias: {bias}  |  ltf={len(ltf)} htf={len(htf)}")
 
             now = time.time()
             if now - last_alert_time < COOLDOWN_SEC:
-                secs_left = int(COOLDOWN_SEC - (now - last_alert_time))
-                log.info(f"  (cooldown — {secs_left}s remaining)")
+                secs = int(COOLDOWN_SEC - (now - last_alert_time))
+                log.info(f"  (cooldown {secs}s remaining)")
             else:
-                signal = analyse(candles)
+                signal = analyse(htf, ltf)
                 if signal:
-                    log.info(f"  ✨ Signal found: {signal['direction']} | {signal['strategy']} | {signal['confidence']}%")
-                    msg = format_signal(signal, price)
-                    ok  = send_telegram(msg)
-                    if ok:
-                        log.info("  📨 Telegram message sent")
-                    last_alert_time = now
+                    # Block flip unless price moved meaningfully
+                    price_move = (abs(price - last_signal_price) / last_signal_price * 100
+                                  if last_signal_price else 999)
+                    if (last_signal_dir and
+                            signal["direction"] != last_signal_dir and
+                            price_move < 0.4):
+                        log.info(f"  ⛔ Flip blocked {last_signal_dir}→{signal['direction']} "
+                                 f"(move={price_move:.2f}%)")
+                    else:
+                        log.info(f"  ✨ {signal['direction']} | {signal['strategy']} | "
+                                 f"{signal['confidence']}% | bias={signal.get('htf_bias')}")
+                        ok = send_telegram(format_signal(signal))
+                        if ok:
+                            log.info("  📨 Telegram sent")
+                        last_alert_time   = now
+                        last_signal_dir   = signal["direction"]
+                        last_signal_price = price
                 else:
-                    log.info("  No high-confidence setup detected")
+                    log.info("  No setup detected")
 
         except KeyboardInterrupt:
-            log.info("Stopped by user.")
+            log.info("Stopped.")
             break
         except Exception as e:
             log.error(f"Loop error: {e}")
 
-        time.sleep(FETCH_INTERVAL_SEC)
+        time.sleep(FETCH_INTERVAL)
 
 if __name__ == "__main__":
-    # Route strategy args correctly (patch __code__ issue for simpler dispatch)
-    # Re-map strategies with explicit arg routing
-    def _run_strat(strat, candles, closes, highs, lows, atr_vals):
-        n = strat.__code__.co_varnames[:strat.__code__.co_argcount]
-        mapping = {"candles": candles, "closes": closes,
-                   "highs": highs, "lows": lows, "atr_vals": atr_vals}
-        kwargs = {k: mapping[k] for k in n if k in mapping}
-        return strat(**kwargs)
-
-    # Patch analyse() to use the router
-    def analyse(candles: list[dict]) -> dict | None:
-        if len(candles) < 60:
-            return None
-        closes = [c["close"] for c in candles]
-        highs  = [c["high"]  for c in candles]
-        lows   = [c["low"]   for c in candles]
-        atr_v  = atr(candles, 14)
-        results = []
-        for strat in ALL_STRATEGIES:
-            try:
-                sig = _run_strat(strat, candles, closes, highs, lows, atr_v)
-                if sig and sig["confidence"] >= MIN_CONFIDENCE:
-                    results.append(sig)
-            except Exception as e:
-                log.debug(f"{strat.__name__} skipped: {e}")
-        if not results:
-            return None
-        best = max(results, key=lambda x: x["confidence"])
-        same_dir = [r for r in results if r["direction"] == best["direction"]]
-        if len(same_dir) > 1:
-            best["confidence"] = min(95, best["confidence"] + (len(same_dir) - 1) * 3)
-            best["confluence"] = [r["strategy"] for r in same_dir if r["strategy"] != best["strategy"]]
-        return best
-
     run()
-
