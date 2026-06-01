@@ -20,7 +20,7 @@ SYMBOL = "BTCUSDT"
 INTERVAL = "15"
 LOOKBACK_CANDLES = 200       # candles kept in memory
 FETCH_INTERVAL_SEC = 300      # how often to fetch new data
-MIN_CONFIDENCE = 78          # minimum confidence % to send alert
+MIN_CONFIDENCE = 72          # minimum confidence % to send alert
 COOLDOWN_SEC = 1800           # minimum seconds between alerts (avoid spam)
 
 logging.basicConfig(
