@@ -17,7 +17,7 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 SYMBOL = "BTCUSDT"
-INTERVAL = "15"
+INTERVAL = "5"
 LOOKBACK_CANDLES = 200       # candles kept in memory
 FETCH_INTERVAL_SEC = 180      # how often to fetch new data
 MIN_CONFIDENCE = 68          # minimum confidence % to send alert
@@ -37,7 +37,7 @@ def fetch_klines(symbol: str, interval: str, limit: int = 200) -> list[dict]:
     try:
         # Kraken uses XBT instead of BTC; interval in minutes
         url = "https://api.kraken.com/0/public/OHLC"
-        params = {"pair": "XBTUSD", "interval": 15}
+        params = {"pair": "XBTUSD", "interval": 5}
         r = requests.get(url, params=params, timeout=15,
                          headers={"User-Agent": "btc-signal-bot/1.0"})
         r.raise_for_status()
