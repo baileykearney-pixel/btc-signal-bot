@@ -472,6 +472,23 @@ def strategy_momentum_breakout(ltf_candles, closes, highs, lows,
                 "note": f"Range breakdown | {last_vol/avg_vol:.1f}x vol | Body {body_pct*100:.0f}%"}
     return None
 
+
+def enforce_min_sl(entry: float, tp: float, sl: float, direction: str) -> tuple[float, float]:
+    """Ensure SL is at least $350 away from entry, TP at least $500 away."""
+    MIN_SL  = 350.0
+    MIN_TP  = 500.0
+    if direction == "LONG":
+        if entry - sl < MIN_SL:
+            sl = entry - MIN_SL
+        if tp - entry < MIN_TP:
+            tp = entry + MIN_TP
+    else:
+        if sl - entry < MIN_SL:
+            sl = entry + MIN_SL
+        if entry - tp < MIN_TP:
+            tp = entry - MIN_TP
+    return tp, sl
+
 # ─── MAIN ANALYSIS ───────────────────────────────────────────────────────────
 
 def analyse(htf_candles: list[dict], ltf_candles: list[dict]) -> dict | None:
@@ -535,6 +552,10 @@ def analyse(htf_candles: list[dict], ltf_candles: list[dict]) -> dict | None:
     best["htf_bias"] = bias
     if sr_zone:
         best["sr_level"] = sr_zone
+    # Enforce minimum SL and TP distances
+    best["tp"], best["sl"] = enforce_min_sl(
+        best["entry"], best["tp"], best["sl"], best["direction"]
+    )
     return best
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
@@ -585,6 +606,86 @@ def format_signal(sig: dict) -> str:
         lines += [f"✅ <b>Confirmed by:</b> {', '.join(sig['confluence'])}"]
     lines += [f"", f"⚠️ <i>Not financial advice. DYOR.</i>"]
     return "\n".join(lines)
+
+
+# ─── TRADE TRACKER ───────────────────────────────────────────────────────────
+
+active_trade = None  # stores the current open signal being tracked
+
+def set_active_trade(signal: dict):
+    """Store a signal to track for TP/SL hit."""
+    global active_trade
+    active_trade = {
+        "direction": signal["direction"],
+        "entry":     signal["entry"],
+        "tp":        signal["tp"],
+        "sl":        signal["sl"],
+        "strategy":  signal["strategy"],
+        "open_time": datetime.now(timezone.utc),
+    }
+
+def check_trade_outcome(current_price: float) -> str | None:
+    """
+    Check if current price has hit TP or SL of the active trade.
+    Returns 'TP', 'SL', or None.
+    """
+    global active_trade
+    if not active_trade:
+        return None
+    direction = active_trade["direction"]
+    tp = active_trade["tp"]
+    sl = active_trade["sl"]
+
+    if direction == "LONG":
+        if current_price >= tp:
+            return "TP"
+        if current_price <= sl:
+            return "SL"
+    else:  # SHORT
+        if current_price <= tp:
+            return "TP"
+        if current_price >= sl:
+            return "SL"
+    return None
+
+def format_outcome(outcome: str, current_price: float) -> str:
+    global active_trade
+    if not active_trade:
+        return ""
+    entry    = active_trade["entry"]
+    tp       = active_trade["tp"]
+    sl       = active_trade["sl"]
+    strategy = active_trade["strategy"]
+    duration = datetime.now(timezone.utc) - active_trade["open_time"]
+    mins     = int(duration.total_seconds() / 60)
+
+    if outcome == "TP":
+        pnl_pct = abs(tp - entry) / entry * 100
+        emoji   = "✅"
+        result  = "TAKE PROFIT HIT"
+        pnl_str = f"+{pnl_pct:.2f}%"
+    else:
+        pnl_pct = abs(sl - entry) / entry * 100
+        emoji   = "❌"
+        result  = "STOP LOSS HIT"
+        pnl_str = f"-{pnl_pct:.2f}%"
+
+    lines = [
+        f"{emoji} <b>{result}</b>",
+        f"",
+        f"📊 <b>Strategy:</b> {strategy}",
+        f"📍 <b>Direction:</b> {active_trade['direction']}",
+        f"",
+        f"💰 <b>Entry:</b>   ${entry:,.2f}",
+        f"🏁 <b>Exit:</b>    ${current_price:,.2f}",
+        f"📈 <b>Result:</b>  {pnl_str}",
+        f"⏱ <b>Duration:</b> {mins} minutes",
+    ]
+    return "\n".join(lines)
+
+def clear_active_trade():
+    global active_trade
+    active_trade = None
 
 # ─── MAIN LOOP ────────────────────────────────────────────────────────────────
 
@@ -646,6 +747,14 @@ def run():
             bias = get_htf_bias(htf) if len(htf) >= 55 else "?"
             log.info(f"BTC ${price:,.2f}  |  1H bias: {bias}  |  ltf={len(ltf)} htf={len(htf)}")
 
+            # Check if active trade hit TP or SL
+            outcome = check_trade_outcome(price)
+            if outcome:
+                log.info(f"  🏁 Trade outcome: {outcome}")
+                msg = format_outcome(outcome, price)
+                send_telegram(msg)
+                clear_active_trade()
+
             now = time.time()
             if now - last_alert_time < COOLDOWN_SEC:
                 secs = int(COOLDOWN_SEC - (now - last_alert_time))
@@ -667,6 +776,7 @@ def run():
                         ok = send_telegram(format_signal(signal))
                         if ok:
                             log.info("  📨 Telegram sent")
+                            set_active_trade(signal)
                         last_alert_time   = now
                         last_signal_dir   = signal["direction"]
                         last_signal_price = price
