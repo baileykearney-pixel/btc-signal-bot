@@ -18,7 +18,7 @@ import requests
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
-SYMBOL            = "XBTUSD"        # Kraken pair
+SYMBOLS           = ["XBTUSD", "ETHUSD"]  # Kraken pairs to monitor
 INTERVAL_HTF      = 60              # 1 hour candles for trend
 INTERVAL_LTF      = 5               # 5 min candles for entry
 LOOKBACK_HTF      = 100             # 1H candles to keep
@@ -39,11 +39,14 @@ log = logging.getLogger("BTCBot")
 # ─── DATA FETCHING ────────────────────────────────────────────────────────────
 
 def fetch_kraken(interval: int, limit: int) -> list[dict]:
+    return fetch_kraken_sym(SYMBOLS[0], interval, limit)
+
+def fetch_kraken_sym(symbol: str, interval: int, limit: int) -> list[dict]:
     """Fetch OHLCV from Kraken. interval in minutes."""
     try:
         r = requests.get(
             "https://api.kraken.com/0/public/OHLC",
-            params={"pair": SYMBOL, "interval": interval},
+            params={"pair": symbol, "interval": interval},
             headers={"User-Agent": "btc-signal-bot/3.0"},
             timeout=15
         )
@@ -473,21 +476,58 @@ def strategy_momentum_breakout(ltf_candles, closes, highs, lows,
     return None
 
 
-def enforce_min_sl(entry: float, tp: float, sl: float, direction: str) -> tuple[float, float]:
-    """Ensure SL is at least $350 away from entry, TP at least $500 away."""
-    MIN_SL  = 350.0
-    MIN_TP  = 500.0
+MIN_RR = 2.0          # minimum reward:risk ratio — below this, signal is blocked
+MIN_SL_DIST = 300.0   # absolute minimum SL distance in dollars
+
+def find_structural_sl(ltf_candles: list[dict], direction: str, entry: float) -> float:
+    """Find SL behind the last real swing high/low on 5-min chart."""
+    lookback = ltf_candles[-20:-1]  # last 20 confirmed candles
     if direction == "LONG":
-        if entry - sl < MIN_SL:
-            sl = entry - MIN_SL
-        if tp - entry < MIN_TP:
-            tp = entry + MIN_TP
+        # SL below the last significant swing low
+        lows = [c["low"] for c in lookback]
+        swing_low = min(lows)
+        sl = swing_low - (entry * 0.001)  # just below the swing low
+        # enforce minimum distance
+        if entry - sl < MIN_SL_DIST:
+            sl = entry - MIN_SL_DIST
+        return sl
     else:
-        if sl - entry < MIN_SL:
-            sl = entry + MIN_SL
-        if entry - tp < MIN_TP:
-            tp = entry - MIN_TP
-    return tp, sl
+        # SL above the last significant swing high
+        highs = [c["high"] for c in lookback]
+        swing_high = max(highs)
+        sl = swing_high + (entry * 0.001)  # just above the swing high
+        if sl - entry < MIN_SL_DIST:
+            sl = entry + MIN_SL_DIST
+        return sl
+
+def find_structural_tp(entry: float, sl: float, direction: str,
+                        sr_levels: list[float]) -> float | None:
+    """
+    Find TP at next real S/R level that gives at least MIN_RR reward:risk.
+    Returns None if no valid level exists (signal should be blocked).
+    """
+    sl_dist = abs(entry - sl)
+    min_tp_dist = sl_dist * MIN_RR
+
+    if direction == "LONG":
+        # Find next resistance level above entry that gives MIN_RR
+        candidates = [l for l in sr_levels if l > entry + min_tp_dist]
+        if candidates:
+            return min(candidates)
+        # No structural level — project MIN_RR target
+        return entry + min_tp_dist
+    else:
+        # Find next support level below entry that gives MIN_RR
+        candidates = [l for l in sr_levels if l < entry - min_tp_dist]
+        if candidates:
+            return max(candidates)
+        return entry - min_tp_dist
+
+def validate_rr(entry: float, tp: float, sl: float) -> float:
+    """Calculate actual R:R ratio."""
+    reward = abs(tp - entry)
+    risk   = abs(entry - sl)
+    return reward / risk if risk > 0 else 0
 
 # ─── MAIN ANALYSIS ───────────────────────────────────────────────────────────
 
@@ -552,10 +592,24 @@ def analyse(htf_candles: list[dict], ltf_candles: list[dict]) -> dict | None:
     best["htf_bias"] = bias
     if sr_zone:
         best["sr_level"] = sr_zone
-    # Enforce minimum SL and TP distances
-    best["tp"], best["sl"] = enforce_min_sl(
-        best["entry"], best["tp"], best["sl"], best["direction"]
-    )
+
+    # Replace TP/SL with structure-based levels
+    entry = best["entry"]
+    direction = best["direction"]
+    struct_sl = find_structural_sl(ltf_candles, direction, entry)
+    struct_tp = find_structural_tp(entry, struct_sl, direction, sr_levels)
+
+    if struct_tp is None:
+        return None  # no valid R:R — block the signal
+
+    rr = validate_rr(entry, struct_tp, struct_sl)
+    if rr < MIN_RR:
+        log.info(f"  ⛔ Signal blocked — R:R only {rr:.1f} (min {MIN_RR})")
+        return None
+
+    best["tp"]  = struct_tp
+    best["sl"]  = struct_sl
+    best["rr"]  = rr
     return best
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
@@ -578,14 +632,15 @@ def send_telegram(text: str) -> bool:
 
 def format_signal(sig: dict) -> str:
     arrow   = "🟢" if sig["direction"] == "LONG" else "🔴"
-    rr      = abs(sig["tp"] - sig["entry"]) / max(abs(sig["entry"] - sig["sl"]), 1)
+    rr      = sig.get("rr") or abs(sig["tp"] - sig["entry"]) / max(abs(sig["entry"] - sig["sl"]), 1)
     now_str = datetime.now(timezone.utc).strftime("%H:%M UTC")
     conf    = sig["confidence"]
     bars    = "█" * (conf // 10) + "░" * (10 - conf // 10)
     bias_emoji = {"BULL": "📈", "BEAR": "📉", "NEUTRAL": "➡️"}.get(sig.get("htf_bias", ""), "")
+    sym_name = sig.get("symbol", "BTC")
 
     lines = [
-        f"{arrow} <b>BTC {sig['direction']} SIGNAL</b>",
+        f"{arrow} <b>{sym_name} {sig['direction']} SIGNAL</b>",
         f"",
         f"📊 <b>Strategy:</b> {sig['strategy']}",
         f"{bias_emoji} <b>1H Trend:</b> {sig.get('htf_bias', 'N/A')}",
@@ -712,57 +767,63 @@ def run():
     last_alert_time      = 0
     last_signal_dir      = None
     last_signal_price    = 0.0
-    htf_buffer: deque    = deque(maxlen=LOOKBACK_HTF)
-    ltf_buffer: deque    = deque(maxlen=LOOKBACK_LTF)
 
-    # Prime buffers
-    htf_init = fetch_kraken(INTERVAL_HTF, LOOKBACK_HTF)
-    ltf_init = fetch_kraken(INTERVAL_LTF, LOOKBACK_LTF)
-    htf_buffer.extend(htf_init)
-    ltf_buffer.extend(ltf_init)
-    log.info(f"Loaded {len(htf_init)} HTF + {len(ltf_init)} LTF candles")
+    # Prime buffers for each symbol
+    symbol_data = {}
+    for sym in SYMBOLS:
+        htf_init = fetch_kraken_sym(sym, INTERVAL_HTF, LOOKBACK_HTF)
+        ltf_init = fetch_kraken_sym(sym, INTERVAL_LTF, LOOKBACK_LTF)
+        symbol_data[sym] = {
+            "htf": deque(htf_init, maxlen=LOOKBACK_HTF),
+            "ltf": deque(ltf_init, maxlen=LOOKBACK_LTF),
+        }
+        log.info(f"{sym}: Loaded {len(htf_init)} HTF + {len(ltf_init)} LTF candles")
 
     while True:
         try:
-            # Refresh data
-            htf_new = fetch_kraken(INTERVAL_HTF, 5)
-            ltf_new = fetch_kraken(INTERVAL_LTF, 10)
+            for sym in SYMBOLS:
+                # Refresh data for this symbol
+                htf_new = fetch_kraken_sym(sym, INTERVAL_HTF, 5)
+                ltf_new = fetch_kraken_sym(sym, INTERVAL_LTF, 10)
+                buf = symbol_data[sym]
 
-            for c in htf_new:
-                if not htf_buffer or c["ts"] > htf_buffer[-1]["ts"]:
-                    htf_buffer.append(c)
-                elif c["ts"] == htf_buffer[-1]["ts"]:
-                    htf_buffer[-1] = c
+                for c in htf_new:
+                    if not buf["htf"] or c["ts"] > buf["htf"][-1]["ts"]:
+                        buf["htf"].append(c)
+                    elif c["ts"] == buf["htf"][-1]["ts"]:
+                        buf["htf"][-1] = c
 
-            for c in ltf_new:
-                if not ltf_buffer or c["ts"] > ltf_buffer[-1]["ts"]:
-                    ltf_buffer.append(c)
-                elif c["ts"] == ltf_buffer[-1]["ts"]:
-                    ltf_buffer[-1] = c
+                for c in ltf_new:
+                    if not buf["ltf"] or c["ts"] > buf["ltf"][-1]["ts"]:
+                        buf["ltf"].append(c)
+                    elif c["ts"] == buf["ltf"][-1]["ts"]:
+                        buf["ltf"][-1] = c
 
-            htf = list(htf_buffer)
-            ltf = list(ltf_buffer)
-            price = ltf[-1]["close"] if ltf else 0
+                htf   = list(buf["htf"])
+                ltf   = list(buf["ltf"])
+                price = ltf[-1]["close"] if ltf else 0
+                name  = "BTC" if "XBT" in sym else "ETH"
 
-            bias = get_htf_bias(htf) if len(htf) >= 55 else "?"
-            log.info(f"BTC ${price:,.2f}  |  1H bias: {bias}  |  ltf={len(ltf)} htf={len(htf)}")
+                bias = get_htf_bias(htf) if len(htf) >= 55 else "?"
+                log.info(f"{name} ${price:,.2f}  |  1H bias: {bias}  |  ltf={len(ltf)} htf={len(htf)}")
 
-            # Check if active trade hit TP or SL
-            outcome = check_trade_outcome(price)
-            if outcome:
-                log.info(f"  🏁 Trade outcome: {outcome}")
-                msg = format_outcome(outcome, price)
-                send_telegram(msg)
-                clear_active_trade()
+                # Check if active trade for this symbol hit TP or SL
+                outcome = check_trade_outcome(price)
+                if outcome:
+                    log.info(f"  🏁 {name} trade outcome: {outcome}")
+                    msg = format_outcome(outcome, price)
+                    send_telegram(msg)
+                    clear_active_trade()
 
-            now = time.time()
-            if now - last_alert_time < COOLDOWN_SEC:
-                secs = int(COOLDOWN_SEC - (now - last_alert_time))
-                log.info(f"  (cooldown {secs}s remaining)")
-            else:
+                now = time.time()
+                if now - last_alert_time < COOLDOWN_SEC:
+                    secs = int(COOLDOWN_SEC - (now - last_alert_time))
+                    log.info(f"  (cooldown {secs}s remaining)")
+                    continue
+
                 signal = analyse(htf, ltf)
                 if signal:
-                    # Block flip unless price moved meaningfully
+                    signal["symbol"] = name
                     price_move = (abs(price - last_signal_price) / last_signal_price * 100
                                   if last_signal_price else 999)
                     if (last_signal_dir and
@@ -771,7 +832,7 @@ def run():
                         log.info(f"  ⛔ Flip blocked {last_signal_dir}→{signal['direction']} "
                                  f"(move={price_move:.2f}%)")
                     else:
-                        log.info(f"  ✨ {signal['direction']} | {signal['strategy']} | "
+                        log.info(f"  ✨ {name} {signal['direction']} | {signal['strategy']} | "
                                  f"{signal['confidence']}% | bias={signal.get('htf_bias')}")
                         ok = send_telegram(format_signal(signal))
                         if ok:
@@ -781,7 +842,7 @@ def run():
                         last_signal_dir   = signal["direction"]
                         last_signal_price = price
                 else:
-                    log.info("  No setup detected")
+                    log.info(f"  {name}: No setup detected")
 
         except KeyboardInterrupt:
             log.info("Stopped.")
@@ -793,3 +854,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
