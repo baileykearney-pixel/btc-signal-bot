@@ -677,6 +677,20 @@ def run():
         try:
             check_summaries()
 
+            # Fast outcome check when trade is active (runs every 30s)
+            if active_trade:
+                sym   = "XBTUSD" if active_trade.get("symbol") == "BTC" else "ETHUSD"
+                price = fetch_price(sym)
+                if price:
+                    outcome = check_trade_outcome(price)
+                    if outcome:
+                        name = active_trade.get("symbol", "BTC")
+                        log.info(f"  🏁 {name} {outcome} @ ${price:,.2f}")
+                        send_telegram(format_outcome(outcome, price))
+                        record_outcome(outcome)
+                        clear_active_trade()
+                        last_alert_time = time.time() - COOLDOWN_SEC + 120
+
             for kraken_sym, name in SYMBOLS:
                 buf = symbol_data[kraken_sym]
 
@@ -702,7 +716,7 @@ def run():
 
                 log.info(f"{name} ${price:,.2f}  |  1H: {bias}  |  ltf={len(ltf)} htf={len(htf)}")
 
-                # Check active trade outcome
+                # Check active trade outcome — ALWAYS runs, even during cooldown
                 if active_trade and active_trade.get("symbol") == name:
                     outcome = check_trade_outcome(price)
                     if outcome:
@@ -716,7 +730,7 @@ def run():
                 if now - last_alert_time < COOLDOWN_SEC:
                     secs = int(COOLDOWN_SEC - (now - last_alert_time))
                     log.info(f"  (cooldown {secs}s)")
-                    continue
+                    continue  # skip signal check but outcome already checked above
 
                 signal = analyse(htf, ltf, name)
                 if signal:
@@ -745,8 +759,13 @@ def run():
         except Exception as e:
             log.error(f"Loop error: {e}")
 
-        time.sleep(FETCH_INTERVAL)
+        # Check more frequently when a trade is active
+        if active_trade:
+            time.sleep(30)
+        else:
+            time.sleep(FETCH_INTERVAL)
 
 if __name__ == "__main__":
     run()
+
 
