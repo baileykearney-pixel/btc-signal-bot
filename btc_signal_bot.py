@@ -1,13 +1,13 @@
 """
-BTC/ETH Signal Bot v5
-- Dual timeframe (1H bias + 5min entry)
-- Structure-based TP/SL
-- Minimum 1:2 R:R enforced
-- Volume confirmation on every signal
-- Fixed TP/SL outcome tracker
-- Daily summary at 8pm UTC
-- Weekly summary every Sunday 8am UTC
-- BTC + ETH monitored simultaneously
+BTC/ETH Signal Bot v6 — Rebuilt after backtest analysis
+Key fixes:
+1. No NEUTRAL bias trading — only BULL/BEAR confirmed signals
+2. MIN_CONFIDENCE raised to 76
+3. MIN_VOL_MULT raised to 2.0
+4. MIN_RR raised to 2.5
+5. Cooldown extended to 4 hours
+6. ADX filter — skip all signals when market is choppy (ADX < 25)
+7. Stronger HTF bias using EMA50/200 with 3-bar confirmation
 """
 
 import time
@@ -25,16 +25,18 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 SYMBOLS        = [("XBTUSD", "BTC"), ("ETHUSD", "ETH")]
 INTERVAL_HTF   = 60
 INTERVAL_LTF   = 5
-LOOKBACK_HTF   = 100
+LOOKBACK_HTF   = 220   # need 200+ for EMA200
 LOOKBACK_LTF   = 200
 FETCH_INTERVAL = 120
-MIN_CONFIDENCE = 70
-COOLDOWN_SEC   = 900
-MIN_VOL_MULT   = 1.4
+MIN_CONFIDENCE = 76    # raised from 70
+MIN_VOL_MULT   = 2.0   # raised from 1.4 — only genuinely high volume moves
+MIN_RR         = 2.5   # raised from 2.0
+COOLDOWN_SEC   = 14400 # 4 hours — raised from 15 min
 SR_ZONE_PCT    = 0.0015
-MIN_RR         = 2.0
 MIN_SL_BTC     = 300.0
 MIN_SL_ETH     = 8.0
+ADX_PERIOD     = 14
+ADX_MIN        = 25    # skip signals when ADX < 25 (choppy market)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -50,7 +52,7 @@ def fetch_kraken(symbol: str, interval: int, limit: int) -> list[dict]:
         r = requests.get(
             "https://api.kraken.com/0/public/OHLC",
             params={"pair": symbol, "interval": interval},
-            headers={"User-Agent": "btc-signal-bot/5.0"},
+            headers={"User-Agent": "btc-signal-bot/6.0"},
             timeout=15
         )
         r.raise_for_status()
@@ -80,7 +82,7 @@ def fetch_price(symbol: str) -> float | None:
         r = requests.get(
             "https://api.kraken.com/0/public/Ticker",
             params={"pair": symbol},
-            headers={"User-Agent": "btc-signal-bot/5.0"},
+            headers={"User-Agent": "btc-signal-bot/6.0"},
             timeout=5
         )
         result   = r.json().get("result", {})
@@ -131,32 +133,81 @@ def avg_volume(candles: list[dict], period: int = 20) -> float:
     vols = [c["vol"] for c in candles[-period-1:-1]]
     return sum(vols) / len(vols) if vols else 1.0
 
-# ─── HTF ANALYSIS ────────────────────────────────────────────────────────────
+def adx(candles: list[dict], period: int = 14) -> float | None:
+    """Average Directional Index — measures trend strength. >25 = trending."""
+    if len(candles) < period * 2 + 1:
+        return None
+    plus_dm  = []
+    minus_dm = []
+    trs      = []
+    for i in range(1, len(candles)):
+        h, l   = candles[i]["high"], candles[i]["low"]
+        ph, pl = candles[i-1]["high"], candles[i-1]["low"]
+        pc     = candles[i-1]["close"]
+        up     = h - ph
+        down   = pl - l
+        plus_dm.append(up if up > down and up > 0 else 0)
+        minus_dm.append(down if down > up and down > 0 else 0)
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+
+    def smooth(vals, p):
+        s = [sum(vals[:p])]
+        for v in vals[p:]:
+            s.append(s[-1] - s[-1]/p + v)
+        return s
+
+    atr_s   = smooth(trs, period)
+    pdm_s   = smooth(plus_dm, period)
+    mdm_s   = smooth(minus_dm, period)
+    di_plus  = [100 * pdm_s[i] / atr_s[i] for i in range(len(atr_s)) if atr_s[i] != 0]
+    di_minus = [100 * mdm_s[i] / atr_s[i] for i in range(len(atr_s)) if atr_s[i] != 0]
+
+    if len(di_plus) < period:
+        return None
+
+    dx = [abs(di_plus[i] - di_minus[i]) / (di_plus[i] + di_minus[i]) * 100
+          for i in range(len(di_plus)) if (di_plus[i] + di_minus[i]) != 0]
+
+    if len(dx) < period:
+        return None
+
+    adx_val = sum(dx[-period:]) / period
+    return adx_val
+
+# ─── HTF ANALYSIS (stronger — EMA50/200 + 3-bar confirmation) ────────────────
 
 def get_htf_bias(htf_candles: list[dict]) -> str:
-    if len(htf_candles) < 55:
+    """
+    Stronger bias detection:
+    - Uses EMA50 vs EMA200 (longer, more reliable than 20/50)
+    - Requires bias to hold for 3 consecutive candles
+    - No NEUTRAL trades — only confirmed BULL or BEAR
+    """
+    if len(htf_candles) < 205:
         return "NEUTRAL"
-    closes      = [c["close"] for c in htf_candles]
-    e20         = ema(closes, 20)
-    e50         = ema(closes, 50)
-    if not e20 or not e50:
+
+    closes = [c["close"] for c in htf_candles]
+    e50    = ema(closes, 50)
+    e200   = ema(closes, 200)
+
+    if len(e50) < 5 or len(e200) < 5:
         return "NEUTRAL"
-    price       = closes[-1]
-    ema_bull    = e20[-1] > e50[-1]
-    ema_bear    = e20[-1] < e50[-1]
-    above_both  = price > e20[-1] and price > e50[-1]
-    below_both  = price < e20[-1] and price < e50[-1]
-    recent_high = max(c["high"] for c in htf_candles[-10:])
-    prior_high  = max(c["high"] for c in htf_candles[-20:-10])
-    recent_low  = min(c["low"]  for c in htf_candles[-10:])
-    prior_low   = min(c["low"]  for c in htf_candles[-20:-10])
-    hh_hl       = recent_high > prior_high and recent_low > prior_low
-    lh_ll       = recent_high < prior_high and recent_low < prior_low
-    bull_score  = sum([ema_bull, above_both, hh_hl])
-    bear_score  = sum([ema_bear, below_both, lh_ll])
-    if bull_score >= 2:
+
+    # Check last 3 candles all agree on direction
+    bull_count = 0
+    bear_count = 0
+    for i in range(-3, 0):
+        price = closes[i]
+        e50_v = e50[i]
+        e200_v = e200[i]
+        if e50_v > e200_v and price > e50_v:
+            bull_count += 1
+        elif e50_v < e200_v and price < e50_v:
+            bear_count += 1
+
+    if bull_count == 3:
         return "BULL"
-    elif bear_score >= 2:
+    elif bear_count == 3:
         return "BEAR"
     return "NEUTRAL"
 
@@ -188,6 +239,16 @@ def price_at_sr_zone(price: float, levels: list[float]) -> float | None:
             return lvl
     return None
 
+def is_trending(htf_candles: list[dict]) -> bool:
+    """Returns True if ADX > ADX_MIN — market is trending, not choppy."""
+    adx_val = adx(htf_candles, ADX_PERIOD)
+    if adx_val is None:
+        return True  # assume trending if can't calculate
+    trending = adx_val >= ADX_MIN
+    if not trending:
+        log.info(f"  ⛔ ADX={adx_val:.1f} < {ADX_MIN} — choppy market, skipping")
+    return trending
+
 # ─── TP/SL LOGIC ─────────────────────────────────────────────────────────────
 
 def find_structural_sl(ltf_candles, direction, entry, name) -> float:
@@ -216,9 +277,10 @@ def find_structural_tp(entry, sl, direction, sr_levels) -> float:
         candidates = [l for l in sr_levels if l < entry - min_tp_dist]
         return max(candidates) if candidates else entry - min_tp_dist
 
-# ─── STRATEGIES ──────────────────────────────────────────────────────────────
+# ─── STRATEGIES (NEUTRAL bias removed from all) ───────────────────────────────
 
 def strategy_sr_rejection(ltf_candles, closes, highs, lows, atr_val, avg_vol, sr_level, bias):
+    """Only fires in confirmed BULL or BEAR — no NEUTRAL."""
     if len(ltf_candles) < 10 or not atr_val:
         return None
     confirm  = ltf_candles[-2]
@@ -228,49 +290,57 @@ def strategy_sr_rejection(ltf_candles, closes, highs, lows, atr_val, avg_vol, sr
     if range_ == 0:
         return None
     body_pct = body / range_
-    if bias in ("BULL", "NEUTRAL"):
+
+    # Only BULL bias for longs
+    if bias == "BULL":
         if (confirm["close"] > confirm["open"] and body_pct > 0.5 and
                 confirm["low"] <= sr_level * 1.001 and
                 confirm["close"] > sr_level and
                 last_vol > avg_vol * MIN_VOL_MULT):
             return {"direction": "LONG", "strategy": "S/R Rejection (Support)",
                     "entry": confirm["close"],
-                    "confidence": 72 + min(10, int(body_pct * 10)),
+                    "confidence": 76 + min(8, int(body_pct * 8)),
                     "note": f"Rejected off ${sr_level:,.0f} support | Vol {last_vol/avg_vol:.1f}x avg"}
-    if bias in ("BEAR", "NEUTRAL"):
+
+    # Only BEAR bias for shorts
+    if bias == "BEAR":
         if (confirm["close"] < confirm["open"] and body_pct > 0.5 and
                 confirm["high"] >= sr_level * 0.999 and
                 confirm["close"] < sr_level and
                 last_vol > avg_vol * MIN_VOL_MULT):
             return {"direction": "SHORT", "strategy": "S/R Rejection (Resistance)",
                     "entry": confirm["close"],
-                    "confidence": 72 + min(10, int(body_pct * 10)),
+                    "confidence": 76 + min(8, int(body_pct * 8)),
                     "note": f"Rejected off ${sr_level:,.0f} resistance | Vol {last_vol/avg_vol:.1f}x avg"}
     return None
 
 def strategy_breakout_retest(ltf_candles, closes, highs, lows, atr_val, avg_vol, sr_level, bias):
+    """Only fires in confirmed BULL or BEAR — no NEUTRAL."""
     if len(ltf_candles) < 15 or not atr_val:
         return None
     recent_closes = closes[-10:]
     confirm       = ltf_candles[-2]
     last_vol      = confirm["vol"]
-    if bias in ("BULL", "NEUTRAL"):
+
+    if bias == "BULL":
         if (any(c > sr_level for c in recent_closes[:-3]) and
                 abs(confirm["close"] - sr_level) / sr_level < 0.002 and
-                confirm["close"] >= sr_level and last_vol > avg_vol * 1.2):
+                confirm["close"] >= sr_level and last_vol > avg_vol * MIN_VOL_MULT):
             return {"direction": "LONG", "strategy": "Breakout Retest (Bull)",
-                    "entry": confirm["close"], "confidence": 74,
+                    "entry": confirm["close"], "confidence": 76,
                     "note": f"Retesting broken ${sr_level:,.0f} as support"}
-    if bias in ("BEAR", "NEUTRAL"):
+
+    if bias == "BEAR":
         if (any(c < sr_level for c in recent_closes[:-3]) and
                 abs(confirm["close"] - sr_level) / sr_level < 0.002 and
-                confirm["close"] <= sr_level and last_vol > avg_vol * 1.2):
+                confirm["close"] <= sr_level and last_vol > avg_vol * MIN_VOL_MULT):
             return {"direction": "SHORT", "strategy": "Breakout Retest (Bear)",
-                    "entry": confirm["close"], "confidence": 74,
+                    "entry": confirm["close"], "confidence": 76,
                     "note": f"Retesting broken ${sr_level:,.0f} as resistance"}
     return None
 
 def strategy_volume_climax(ltf_candles, closes, atr_val, avg_vol, bias):
+    """Only fires in confirmed BULL or BEAR — no NEUTRAL."""
     if len(ltf_candles) < 20 or not atr_val:
         return None
     confirm    = ltf_candles[-2]
@@ -281,17 +351,21 @@ def strategy_volume_climax(ltf_candles, closes, atr_val, avg_vol, bias):
     upper_wick = confirm["high"] - max(confirm["open"], confirm["close"])
     lower_wick = min(confirm["open"], confirm["close"]) - confirm["low"]
     body       = abs(confirm["close"] - confirm["open"])
-    if (bias in ("BEAR", "NEUTRAL") and last_vol > avg_vol * 2.0 and
+
+    # Only short in confirmed BEAR
+    if (bias == "BEAR" and last_vol > avg_vol * MIN_VOL_MULT and
             upper_wick > body * 1.5 and upper_wick > range_ * 0.4 and
             confirm["close"] < confirm["open"]):
         return {"direction": "SHORT", "strategy": "Volume Climax Reversal (Bearish)",
-                "entry": confirm["close"], "confidence": 76,
+                "entry": confirm["close"], "confidence": 78,
                 "note": f"Exhaustion wick {last_vol/avg_vol:.1f}x volume — buyers trapped"}
-    if (bias in ("BULL", "NEUTRAL") and last_vol > avg_vol * 2.0 and
+
+    # Only long in confirmed BULL
+    if (bias == "BULL" and last_vol > avg_vol * MIN_VOL_MULT and
             lower_wick > body * 1.5 and lower_wick > range_ * 0.4 and
             confirm["close"] > confirm["open"]):
         return {"direction": "LONG", "strategy": "Volume Climax Reversal (Bullish)",
-                "entry": confirm["close"], "confidence": 76,
+                "entry": confirm["close"], "confidence": 78,
                 "note": f"Exhaustion wick {last_vol/avg_vol:.1f}x volume — sellers trapped"}
     return None
 
@@ -306,17 +380,19 @@ def strategy_trend_continuation(ltf_candles, closes, atr_val, avg_vol, bias):
     price    = confirm["close"]
     dist_pct = abs(price - e20[-2]) / e20[-2]
     rsi_val  = rsi(closes[:-1], 14)
+
     if (bias == "BULL" and dist_pct < 0.003 and
             confirm["close"] > confirm["open"] and confirm["close"] > e20[-2] and
             last_vol > avg_vol * MIN_VOL_MULT and rsi_val and 35 < rsi_val < 60):
         return {"direction": "LONG", "strategy": "Trend Continuation (EMA20 Bounce)",
-                "entry": price, "confidence": 73,
+                "entry": price, "confidence": 76,
                 "note": f"EMA20 bounce in uptrend | RSI {rsi_val:.0f} | Vol {last_vol/avg_vol:.1f}x"}
+
     if (bias == "BEAR" and dist_pct < 0.003 and
             confirm["close"] < confirm["open"] and confirm["close"] < e20[-2] and
             last_vol > avg_vol * MIN_VOL_MULT and rsi_val and 40 < rsi_val < 65):
         return {"direction": "SHORT", "strategy": "Trend Continuation (EMA20 Rejection)",
-                "entry": price, "confidence": 73,
+                "entry": price, "confidence": 76,
                 "note": f"EMA20 rejection in downtrend | RSI {rsi_val:.0f} | Vol {last_vol/avg_vol:.1f}x"}
     return None
 
@@ -333,26 +409,39 @@ def strategy_momentum_breakout(ltf_candles, closes, highs, lows, atr_val, avg_vo
     prior_range = max(highs[-12:-2]) - min(lows[-12:-2])
     if prior_range > atr_val * 3:
         return None
+
     if (bias == "BULL" and confirm["close"] > confirm["open"] and
-            body_pct > 0.65 and body > atr_val * 0.8 and last_vol > avg_vol * 2.0):
+            body_pct > 0.65 and body > atr_val * 0.8 and last_vol > avg_vol * MIN_VOL_MULT):
         return {"direction": "LONG", "strategy": "Momentum Breakout (Bull)",
                 "entry": confirm["close"],
-                "confidence": min(83, 75 + int(last_vol / avg_vol * 2)),
+                "confidence": min(88, 76 + int(last_vol / avg_vol * 2)),
                 "note": f"Range breakout | {last_vol/avg_vol:.1f}x vol | Body {body_pct*100:.0f}%"}
+
     if (bias == "BEAR" and confirm["close"] < confirm["open"] and
-            body_pct > 0.65 and body > atr_val * 0.8 and last_vol > avg_vol * 2.0):
+            body_pct > 0.65 and body > atr_val * 0.8 and last_vol > avg_vol * MIN_VOL_MULT):
         return {"direction": "SHORT", "strategy": "Momentum Breakout (Bear)",
                 "entry": confirm["close"],
-                "confidence": min(83, 75 + int(last_vol / avg_vol * 2)),
+                "confidence": min(88, 76 + int(last_vol / avg_vol * 2)),
                 "note": f"Range breakdown | {last_vol/avg_vol:.1f}x vol | Body {body_pct*100:.0f}%"}
     return None
 
 # ─── MAIN ANALYSIS ───────────────────────────────────────────────────────────
 
 def analyse(htf_candles, ltf_candles, name) -> dict | None:
-    if len(htf_candles) < 55 or len(ltf_candles) < 25:
+    if len(htf_candles) < 205 or len(ltf_candles) < 25:
         return None
-    bias      = get_htf_bias(htf_candles)
+
+    bias = get_htf_bias(htf_candles)
+
+    # Skip NEUTRAL entirely
+    if bias == "NEUTRAL":
+        log.info(f"  ⛔ {name} bias NEUTRAL — no trade")
+        return None
+
+    # Skip choppy markets
+    if not is_trending(htf_candles):
+        return None
+
     sr_levels = get_key_levels(htf_candles)
     closes    = [c["close"] for c in ltf_candles]
     highs     = [c["high"]  for c in ltf_candles]
@@ -394,7 +483,6 @@ def analyse(htf_candles, ltf_candles, name) -> dict | None:
     if sr_zone:
         best["sr_level"] = sr_zone
 
-    # Structure-based TP/SL
     sl = find_structural_sl(ltf_candles, best["direction"], best["entry"], name)
     tp = find_structural_tp(best["entry"], sl, best["direction"], sr_levels)
     rr = abs(tp - best["entry"]) / abs(best["entry"] - sl)
@@ -523,20 +611,16 @@ def build_summary(trades: list[dict], title: str) -> str:
     losses   = [t for t in trades if t["outcome"] == "SL"]
     total    = len(trades)
     win_rate = len(wins) / total * 100
-
-    # P&L assuming 1% risk per trade, compounding
-    risk = 1.0
-    weekly_pnl = sum(risk * t["rr"] for t in wins) - len(losses) * risk
-    days_in_period = 7 if "Weekly" in title else 1
-    annual_pnl = weekly_pnl * (365 / days_in_period)
-
-    avg_duration = sum(t["duration"] for t in trades) / total
-    avg_rr       = sum(t["rr"] for t in wins) / len(wins) if wins else 0
-    btc_trades   = [t for t in trades if t["symbol"] == "BTC"]
-    eth_trades   = [t for t in trades if t["symbol"] == "ETH"]
-
-    best  = max(trades, key=lambda t: t["pnl_pct"]) if wins else None
-    worst = min(trades, key=lambda t: t["pnl_pct"]) if losses else None
+    days     = 7 if "Weekly" in title else 1
+    risk     = 1.0
+    pnl      = sum(risk * t["rr"] for t in wins) - len(losses) * risk
+    annual   = pnl * (365 / days)
+    avg_rr   = sum(t["rr"] for t in wins) / len(wins) if wins else 0
+    avg_dur  = sum(t["duration"] for t in trades) / total
+    btc      = [t for t in trades if t["symbol"] == "BTC"]
+    eth      = [t for t in trades if t["symbol"] == "ETH"]
+    best     = max(trades, key=lambda t: t["pnl_pct"]) if wins else None
+    worst    = min(trades, key=lambda t: t["pnl_pct"]) if losses else None
 
     lines = [
         f"📊 <b>{title}</b>",
@@ -546,12 +630,12 @@ def build_summary(trades: list[dict], title: str) -> str:
         f"✅ <b>Wins:</b> {len(wins)}  ❌ <b>Losses:</b> {len(losses)}",
         f"🎯 <b>Win Rate:</b> {win_rate:.1f}%",
         f"⚖️  <b>Avg R:R on wins:</b> 1:{avg_rr:.1f}",
-        f"⏱ <b>Avg Duration:</b> {avg_duration:.0f} min",
+        f"⏱ <b>Avg Duration:</b> {avg_dur:.0f} min",
         f"",
-        f"₿ BTC: {len(btc_trades)} trades  |  ETH: {len(eth_trades)} trades",
+        f"₿ BTC: {len(btc)} trades  |  ETH: {len(eth)} trades",
         f"",
-        f"💰 <b>Est. P&L this period</b> (1% risk/trade): {weekly_pnl:+.1f}%",
-        f"📅 <b>Est. Annual P&L:</b> {annual_pnl:+.0f}%",
+        f"💰 <b>Est. P&L</b> (1% risk/trade): {pnl:+.1f}%",
+        f"📅 <b>Est. Annual P&L:</b> {annual:+.0f}%",
     ]
     if best:
         lines += [f"", f"🏆 <b>Best:</b> {best['symbol']} {best['direction']} +{best['pnl_pct']:.2f}%"]
@@ -563,23 +647,18 @@ def build_summary(trades: list[dict], title: str) -> str:
 def check_summaries():
     global last_daily_summary, last_weekly_summary, trade_history
     now = datetime.now(timezone.utc)
-
-    # Daily at 8pm UTC
     if now.hour == 20 and now.minute < 3:
         if last_daily_summary is None or (now - last_daily_summary).seconds > 3600:
             last_daily_summary = now
-            today_trades = [t for t in trade_history
-                            if (now - t["time"]).total_seconds() < 86400]
-            send_telegram(build_summary(today_trades, "Daily Summary"))
+            today = [t for t in trade_history if (now - t["time"]).total_seconds() < 86400]
+            send_telegram(build_summary(today, "Daily Summary"))
             log.info("📊 Daily summary sent")
-
-    # Weekly every Sunday at 8am UTC
     if now.weekday() == 6 and now.hour == 8 and now.minute < 3:
         if last_weekly_summary is None or (now - last_weekly_summary).days >= 6:
             last_weekly_summary = now
             send_telegram(build_summary(trade_history, "Weekly Summary"))
             log.info("📊 Weekly summary sent")
-            trade_history = []  # reset after weekly
+            trade_history = []
 
 # ─── TELEGRAM ────────────────────────────────────────────────────────────────
 
@@ -605,7 +684,7 @@ def format_signal(sig: dict) -> str:
     now_str    = datetime.now(timezone.utc).strftime("%H:%M UTC")
     conf       = sig["confidence"]
     bars       = "█" * (conf // 10) + "░" * (10 - conf // 10)
-    bias_emoji = {"BULL": "📈", "BEAR": "📉", "NEUTRAL": "➡️"}.get(sig.get("htf_bias", ""), "")
+    bias_emoji = {"BULL": "📈", "BEAR": "📉"}.get(sig.get("htf_bias", ""), "")
     sym        = sig.get("symbol", "BTC")
     entry      = sig["entry"]
     tp         = sig["tp"]
@@ -642,7 +721,7 @@ def keep_alive():
     app = Flask("")
     @app.route("/")
     def home():
-        return "BTC/ETH Signal Bot v5 running ✅"
+        return "BTC/ETH Signal Bot v6 running ✅"
     t = Thread(target=lambda: app.run(host="0.0.0.0", port=8080))
     t.daemon = True
     t.start()
@@ -651,9 +730,9 @@ def keep_alive():
 
 def run():
     log.info("═" * 55)
-    log.info("  BTC/ETH Signal Bot v5")
-    log.info(f"  Symbols: BTC + ETH  |  HTF: {INTERVAL_HTF}min  |  LTF: {INTERVAL_LTF}min")
-    log.info(f"  Min confidence: {MIN_CONFIDENCE}%  |  Min R:R: {MIN_RR}  |  Cooldown: {COOLDOWN_SEC}s")
+    log.info("  BTC/ETH Signal Bot v6")
+    log.info(f"  Confidence: {MIN_CONFIDENCE}%  |  Vol: {MIN_VOL_MULT}x  |  R:R: {MIN_RR}  |  Cooldown: {COOLDOWN_SEC//3600}h")
+    log.info(f"  ADX filter: >{ADX_MIN}  |  Bias: EMA50/200 confirmed BULL/BEAR only")
     log.info("═" * 55)
 
     keep_alive()
@@ -677,7 +756,7 @@ def run():
         try:
             check_summaries()
 
-            # Fast outcome check when trade is active (runs every 30s)
+            # Fast outcome check every 30s when trade is active
             if active_trade:
                 sym   = "XBTUSD" if active_trade.get("symbol") == "BTC" else "ETHUSD"
                 price = fetch_price(sym)
@@ -712,25 +791,15 @@ def run():
                 htf   = list(buf["htf"])
                 ltf   = list(buf["ltf"])
                 price = fetch_price(kraken_sym) or (ltf[-1]["close"] if ltf else 0)
-                bias  = get_htf_bias(htf) if len(htf) >= 55 else "?"
+                bias  = get_htf_bias(htf) if len(htf) >= 205 else "?"
 
                 log.info(f"{name} ${price:,.2f}  |  1H: {bias}  |  ltf={len(ltf)} htf={len(htf)}")
-
-                # Check active trade outcome — ALWAYS runs, even during cooldown
-                if active_trade and active_trade.get("symbol") == name:
-                    outcome = check_trade_outcome(price)
-                    if outcome:
-                        log.info(f"  🏁 {name} {outcome}")
-                        send_telegram(format_outcome(outcome, price))
-                        record_outcome(outcome)
-                        clear_active_trade()
-                        last_alert_time = time.time() - COOLDOWN_SEC + 120
 
                 now = time.time()
                 if now - last_alert_time < COOLDOWN_SEC:
                     secs = int(COOLDOWN_SEC - (now - last_alert_time))
-                    log.info(f"  (cooldown {secs}s)")
-                    continue  # skip signal check but outcome already checked above
+                    log.info(f"  (cooldown {secs//3600}h {(secs%3600)//60}m)")
+                    continue
 
                 signal = analyse(htf, ltf, name)
                 if signal:
@@ -759,7 +828,6 @@ def run():
         except Exception as e:
             log.error(f"Loop error: {e}")
 
-        # Check more frequently when a trade is active
         if active_trade:
             time.sleep(30)
         else:
@@ -767,5 +835,4 @@ def run():
 
 if __name__ == "__main__":
     run()
-
 
