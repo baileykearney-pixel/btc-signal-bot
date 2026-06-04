@@ -33,18 +33,18 @@ SYMBOLS = [
     ("LTCUSD",  "LTC"),
     ("BCHUSD",  "BCH"),
     ("UNIUSD",  "UNI"),
-    ("AAVEUSD", "AAVE"),
     ("ALGOUSD", "ALGO"),
     ("XLMUSD",  "XLM"),
     ("TRXUSD",  "TRX"),
-    ("FILUSD",  "FIL"),
-    ("ICPUSD",  "ICP"),
-    ("NEARUSD", "NEAR"),
     ("APTUSD",  "APT"),
-    ("ARBUSD",  "ARB"),
-    ("OPUSD",   "OP"),
     ("INJUSD",  "INJ"),
     ("SUIUSD",  "SUI"),
+    ("PEPEUSD", "PEPE"),
+    ("TONUSD",  "TON"),
+    ("RENDERUSD","RENDER"),
+    ("HBARUSD", "HBAR"),
+    ("BONKUSD", "BONK"),
+    ("WIFUSD",  "WIF"),
 ]
 
 INTERVAL_HTF      = 60      # 1H candles
@@ -600,7 +600,7 @@ def keep_alive():
 def run():
     log.info("═" * 60)
     log.info("  Signal Bot v7 — EMA200 Touch Strategy")
-    log.info(f"  {len(SYMBOLS)} pairs  |  Cooldown: {COOLDOWN_SEC//3600}h  |  Min R:R: {MIN_RR}")
+    log.info(f"  {len(SYMBOLS)} pairs (Pepperstone verified)  |  Cooldown: {COOLDOWN_SEC//3600}h  |  Min R:R: {MIN_RR}")
     log.info(f"  EMA200 zone: {EMA200_ZONE_PCT*100:.0f}%  |  Min vol: {MIN_VOL_MULT}x  |  ADX > {ADX_MIN}")
     log.info("═" * 60)
 
@@ -694,4 +694,5 @@ def run():
 
 if __name__ == "__main__":
     run()
+
 
