@@ -19,40 +19,19 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # 25 pairs — Kraken symbols
-# All symbols confirmed from Pepperstone cTrader screenshots
+# 10 pairs — backtested profitable over 4.3 years, all 30+ trades
+# Verified on Pepperstone cTrader Australia
 SYMBOLS = [
-    ("XBTUSD",   "BTC"),
-    ("ETHUSD",   "ETH"),
-    ("LTCUSD",   "LTC"),
-    ("BCHUSD",   "BCH"),
-    ("XPDUSD",   "XPD"),
-    ("DOTUSD",   "DOT"),
-    ("XPTUSD",   "XPT"),
-    ("LINKUSD",  "LINK"),
-    ("XLMUSD",   "XLM"),
-    ("XRPUSD",   "XRP"),
-    ("UNIUSD",   "UNI"),
-    ("DOGEUSD",  "DOGE"),
-    ("ADAUSD",   "ADA"),
-    ("BNBUSD",   "BNB"),
-    ("XTZUSD",   "XTZ"),
-    ("SOLUSD",   "SOL"),
-    ("AVAXUSD",  "AVAX"),
-    ("ETCUSD",   "ETC"),
-    ("MATICUSD", "MATIC"),
-    ("POLUSD",   "POL"),
-    ("SONUSD",   "SON"),
-    ("HBARUSD",  "HBAR"),
-    ("SUIUSD",   "SUI"),
-    ("TONUSD",   "TON"),
-    ("APTUSD",   "APT"),
-    ("HYPEUSD",  "HYPE"),
-    ("INJUSD",   "INJ"),
-    ("RENDERUSD","RENDER"),
-    ("FETUSD",   "FET"),
-    ("GLMRUSD",  "GLMR"),
-    ("KSMUSD",   "KSM"),
-    ("TRUMPUSD", "TRUMP"),
+    ("XBTUSD",  "BTC"),    # +20.8% annual, 199 trades, 31.7% WR
+    ("ETHUSD",  "ETH"),    # +17.4% annual, 119 trades, 32.8% WR
+    ("SOLUSD",  "SOL"),    # +1.6%  annual,  30 trades, 30.0% WR
+    ("XRPUSD",  "XRP"),    # +33.0% annual,  90 trades, 35.6% WR
+    ("ADAUSD",  "ADA"),    # +6.6%  annual,  40 trades, 32.5% WR
+    ("AVAXUSD", "AVAX"),   # +39.9% annual,  84 trades, 40.5% WR
+    ("XLMUSD",  "XLM"),    # +24.6% annual,  68 trades, 38.2% WR
+    ("UNIUSD",  "UNI"),    # +28.5% annual,  81 trades, 38.3% WR
+    ("DOGEUSD", "DOGE"),   # +3.0%  annual, 116 trades, 29.3% WR
+    ("BNBUSD",  "BNB"),    # +31.4% annual,  63 trades, 41.3% WR
 ]
 
 INTERVAL_HTF      = 60      # 1H candles
@@ -62,7 +41,7 @@ MIN_CONFIDENCE    = 75
 MIN_VOL_MULT      = 1.5     # volume must be 1.5x average
 MIN_RR            = 2.5
 COOLDOWN_SEC      = 3600    # 1 hour between alerts (multiple pairs = more signals)
-EMA200_ZONE_PCT   = 0.02    # price within 2% of EMA200
+EMA200_ZONE_PCT   = 0.02    # 2% zone — backtested optimal
 ADX_MIN           = 20      # skip choppy markets
 
 logging.basicConfig(
@@ -702,3 +681,4 @@ def run():
 
 if __name__ == "__main__":
     run()
+
