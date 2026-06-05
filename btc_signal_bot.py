@@ -19,32 +19,40 @@ TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 # 25 pairs — Kraken symbols
+# All symbols confirmed from Pepperstone cTrader screenshots
 SYMBOLS = [
-    ("XBTUSD",  "BTC"),
-    ("ETHUSD",  "ETH"),
-    ("SOLUSD",  "SOL"),
-    ("XRPUSD",  "XRP"),
-    ("ADAUSD",  "ADA"),
-    ("DOTUSD",  "DOT"),
-    ("LINKUSD", "LINK"),
-    ("AVAXUSD", "AVAX"),
-    ("MATICUSD","MATIC"),
-    ("ATOMUSD", "ATOM"),
-    ("LTCUSD",  "LTC"),
-    ("BCHUSD",  "BCH"),
-    ("UNIUSD",  "UNI"),
-    ("ALGOUSD", "ALGO"),
-    ("XLMUSD",  "XLM"),
-    ("TRXUSD",  "TRX"),
-    ("APTUSD",  "APT"),
-    ("INJUSD",  "INJ"),
-    ("SUIUSD",  "SUI"),
-    ("PEPEUSD", "PEPE"),
-    ("TONUSD",  "TON"),
+    ("XBTUSD",   "BTC"),
+    ("ETHUSD",   "ETH"),
+    ("LTCUSD",   "LTC"),
+    ("BCHUSD",   "BCH"),
+    ("XPDUSD",   "XPD"),
+    ("DOTUSD",   "DOT"),
+    ("XPTUSD",   "XPT"),
+    ("LINKUSD",  "LINK"),
+    ("XLMUSD",   "XLM"),
+    ("XRPUSD",   "XRP"),
+    ("UNIUSD",   "UNI"),
+    ("DOGEUSD",  "DOGE"),
+    ("ADAUSD",   "ADA"),
+    ("BNBUSD",   "BNB"),
+    ("XTZUSD",   "XTZ"),
+    ("SOLUSD",   "SOL"),
+    ("AVAXUSD",  "AVAX"),
+    ("ETCUSD",   "ETC"),
+    ("MATICUSD", "MATIC"),
+    ("POLUSD",   "POL"),
+    ("SONUSD",   "SON"),
+    ("HBARUSD",  "HBAR"),
+    ("SUIUSD",   "SUI"),
+    ("TONUSD",   "TON"),
+    ("APTUSD",   "APT"),
+    ("HYPEUSD",  "HYPE"),
+    ("INJUSD",   "INJ"),
     ("RENDERUSD","RENDER"),
-    ("HBARUSD", "HBAR"),
-    ("BONKUSD", "BONK"),
-    ("WIFUSD",  "WIF"),
+    ("FETUSD",   "FET"),
+    ("GLMRUSD",  "GLMR"),
+    ("KSMUSD",   "KSM"),
+    ("TRUMPUSD", "TRUMP"),
 ]
 
 INTERVAL_HTF      = 60      # 1H candles
@@ -694,5 +702,3 @@ def run():
 
 if __name__ == "__main__":
     run()
-
-
