@@ -147,7 +147,7 @@ def get_account_balance() -> float | None:
     for attempt in range(2):
         try:
             r = requests.get(
-                f"{CTRADER_BASE_URL}/tradingaccounts/{CTRADER_ACCOUNT_ID}",
+                f"https://api.spotware.com/connect/tradingaccounts/{CTRADER_ACCOUNT_ID}",
                 headers={"Authorization": f"Bearer {CTRADER_ACCESS_TOKEN}"},
                 timeout=15,
             )
@@ -211,7 +211,7 @@ def place_ctrader_order(signal: dict) -> bool:
     for attempt in range(2):
         try:
             r = requests.post(
-                f"{CTRADER_BASE_URL}/tradingaccounts/{CTRADER_ACCOUNT_ID}/orders",
+                f"https://api.spotware.com/connect/tradingaccounts/{CTRADER_ACCOUNT_ID}/orders",
                 headers={
                     "Authorization": f"Bearer {CTRADER_ACCESS_TOKEN}",
                     "Content-Type": "application/json",
