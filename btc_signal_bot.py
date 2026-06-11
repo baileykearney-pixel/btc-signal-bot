@@ -1,28 +1,7 @@
 """
-BOS + Order Block Signal Bot — Safety Hardened
+BOS + Order Block Signal Bot — Safety Hardened + cTrader Auto Execution
 Strategy: Break of Structure + Order Block retest
 Timeframe: 4H candles | 10 pairs | Kraken data feed
-
-Backtest results (3 exchanges, 2013–2026, no slippage):
-  Win rate:         ~50–54% across all years and exchanges
-  R:R:              2:1 (TP = 2× SL distance)
-  Profitable years: 28/28
-  EV per trade:     +0.50R
-  Breakeven WR:     33.3%  (actual margin: +13–17pp above breakeven)
-  Worst consec. losses: 25 (single exchange)
-  Max intra-year DD:    6% at 1% risk
-
-Safety fixes included:
-  1. Token expiry    — auto refresh on 401 errors
-  2. Position size   — hard cap at 2% max risk, sanity check before every order
-  3. Order rejection — Telegram alert if cTrader rejects an order
-  4. Duplicate trade — checks existing positions before placing
-  5. Data outage     — Binance fallback if Kraken fails
-  6. Railway outage  — nothing to do, accepted risk
-  7. Telegram retry  — 3 retries with 5s delay on failure
-  8. Balance check   — verifies account before each trade
-  9. Market gaps     — accepted, slippage already in audit
-  10. Stale candle   — always uses candles[-2] (last closed bar)
 """
 
 import time
@@ -33,11 +12,10 @@ from datetime import datetime, timezone
 from collections import deque
 import requests
 
-# ─── TRADE PERSISTENCE (fix: restart mid-trade) ───────────────────────────────
+# ─── TRADE PERSISTENCE ────────────────────────────────────────────────────────
 TRADES_FILE = "/tmp/active_trades.json"
 
 def save_trades():
-    """Save active trades to disk so they survive restarts."""
     try:
         serialisable = {}
         for k, v in active_trades.items():
@@ -50,7 +28,6 @@ def save_trades():
         log.warning(f"Could not save trades: {e}")
 
 def load_trades():
-    """Reload active trades from disk on startup."""
     try:
         if not os.path.exists(TRADES_FILE):
             return
@@ -70,6 +47,30 @@ def load_trades():
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
+# cTrader config
+CTRADER_ACCESS_TOKEN  = os.environ.get("CTRADER_ACCESS_TOKEN", "")
+CTRADER_REFRESH_TOKEN = os.environ.get("CTRADER_REFRESH_TOKEN", "")
+CTRADER_ACCOUNT_ID    = os.environ.get("CTRADER_ACCOUNT_ID", "")
+CTRADER_CLIENT_ID     = os.environ.get("CTRADER_CLIENT_ID", "")
+CTRADER_CLIENT_SECRET = os.environ.get("CTRADER_CLIENT_SECRET", "")
+CTRADER_BASE_URL      = "https://api.ctrader.com/v2"  # REST JSON API
+
+# Map signal symbol names to cTrader symbol names
+CTRADER_SYMBOLS = {
+    "BTC":  "BTCUSD",
+    "ETH":  "ETHUSD",
+    "SOL":  "SOLUSD",
+    "XRP":  "XRPUSD",
+    "ADA":  "ADAUSD",
+    "AVAX": "AVAXUSD",
+    "XLM":  "XLMUSD",
+    "UNI":  "UNIUSD",
+    "DOGE": "DOGEUSD",
+    "BNB":  "BNBUSD",
+}
+
+RISK_PCT = 1.0  # % of balance to risk per trade
+
 SYMBOLS = [
     ("XBTUSD",  "BTC"),
     ("ETHUSD",  "ETH"),
@@ -83,7 +84,6 @@ SYMBOLS = [
     ("BNBUSD",  "BNB"),
 ]
 
-# Binance fallback symbols (fix #5)
 BINANCE_SYMBOLS = {
     "XBTUSD": "BTCUSDT", "ETHUSD": "ETHUSDT", "SOLUSD": "SOLUSDT",
     "XRPUSD": "XRPUSDT", "ADAUSD": "ADAUSDT", "AVAXUSD": "AVAXUSDT",
@@ -99,7 +99,7 @@ OB_EXPIRE_BARS    = 50
 OB_BUFFER_PCT     = 0.10
 RR_TARGET         = 2.0
 COOLDOWN_PER_PAIR = 57600
-MAX_RISK_PCT      = 2.0   # hard cap — never risk more than this % (fix #2)
+MAX_RISK_PCT      = 2.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -108,7 +108,155 @@ logging.basicConfig(
 )
 log = logging.getLogger("BOSBot")
 
-# ─── DATA FETCHING + BINANCE FALLBACK (fix #5) ───────────────────────────────
+# ─── cTRADER AUTO EXECUTION ───────────────────────────────────────────────────
+
+def refresh_ctrader_token() -> bool:
+    """Refresh the access token using the refresh token (fix #1)."""
+    global CTRADER_ACCESS_TOKEN
+    if not CTRADER_REFRESH_TOKEN or not CTRADER_CLIENT_ID or not CTRADER_CLIENT_SECRET:
+        log.warning("cTrader refresh credentials not set")
+        return False
+    try:
+        r = requests.post(
+            "https://connect.spotware.com/apps/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": CTRADER_REFRESH_TOKEN,
+                "client_id": CTRADER_CLIENT_ID,
+                "client_secret": CTRADER_CLIENT_SECRET,
+            },
+            timeout=15,
+        )
+        data = r.json()
+        new_token = data.get("accessToken") or data.get("access_token")
+        if new_token:
+            CTRADER_ACCESS_TOKEN = new_token
+            log.info("  ✅ cTrader access token refreshed")
+            return True
+        log.error(f"  Token refresh failed: {data}")
+        return False
+    except Exception as e:
+        log.error(f"  Token refresh error: {e}")
+        return False
+
+def get_account_balance() -> float | None:
+    """Fetch account balance from cTrader."""
+    global CTRADER_ACCESS_TOKEN
+    if not CTRADER_ACCESS_TOKEN or not CTRADER_ACCOUNT_ID:
+        return None
+    for attempt in range(2):
+        try:
+            r = requests.get(
+                f"{CTRADER_BASE_URL}/tradingaccounts/{CTRADER_ACCOUNT_ID}",
+                headers={"Authorization": f"Bearer {CTRADER_ACCESS_TOKEN}"},
+                timeout=15,
+            )
+            if r.status_code == 401:
+                if attempt == 0 and refresh_ctrader_token():
+                    continue
+                return None
+            data = r.json()
+            balance = data.get("balance") or data.get("Balance")
+            if balance is not None:
+                return float(balance) / 100  # cTrader returns balance in cents
+        except Exception as e:
+            log.error(f"  Balance fetch error: {e}")
+    return None
+
+def place_ctrader_order(signal: dict) -> bool:
+    """
+    Place a market order on cTrader with SL and TP.
+    Returns True if order placed successfully.
+    """
+    global CTRADER_ACCESS_TOKEN
+
+    if not CTRADER_ACCESS_TOKEN or not CTRADER_ACCOUNT_ID:
+        log.warning("  ⚠️ cTrader not configured — signal sent to Telegram only")
+        return False
+
+    ct_symbol = CTRADER_SYMBOLS.get(signal["symbol"])
+    if not ct_symbol:
+        log.warning(f"  ⚠️ No cTrader symbol mapping for {signal['symbol']}")
+        return False
+
+    # Get account balance for position sizing (fix #8)
+    balance = get_account_balance()
+    if balance is None:
+        log.warning("  ⚠️ Could not fetch balance — skipping auto execution")
+        send_telegram(f"⚠️ <b>cTrader balance fetch failed</b> — {signal['symbol']} signal sent but NOT auto-executed")
+        return False
+
+    log.info(f"  💰 Account balance: ${balance:,.2f}")
+
+    # Calculate position size
+    entry = signal["entry"]
+    sl    = signal["sl"]
+    lots  = safe_lot_size(entry, sl, balance, RISK_PCT)
+
+    trade_side = "BUY" if signal["direction"] == "LONG" else "SELL"
+
+    # Build order payload
+    payload = {
+        "symbolName": ct_symbol,
+        "tradeSide": trade_side,
+        "volume": int(lots * 100),  # cTrader uses units (lots * 100)
+        "orderType": "MARKET",
+        "stopLoss": round(sl, 5),
+        "takeProfit": round(signal["tp"], 5),
+        "comment": f"BOS+OB Bot | {signal['strategy'][:20]}",
+    }
+
+    log.info(f"  📤 Placing cTrader order: {trade_side} {ct_symbol} {lots} lots | SL={sl:.4f} TP={signal['tp']:.4f}")
+
+    for attempt in range(2):
+        try:
+            r = requests.post(
+                f"{CTRADER_BASE_URL}/tradingaccounts/{CTRADER_ACCOUNT_ID}/orders",
+                headers={
+                    "Authorization": f"Bearer {CTRADER_ACCESS_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=15,
+            )
+
+            if r.status_code == 401:
+                if attempt == 0 and refresh_ctrader_token():
+                    continue
+                log.error("  ❌ cTrader auth failed after token refresh")
+                send_telegram(f"❌ <b>cTrader auth failed</b> — {signal['symbol']} NOT executed. Token may need renewal.")
+                return False
+
+            if r.status_code in (200, 201):
+                order_data = r.json()
+                order_id   = order_data.get("orderId") or order_data.get("id") or "unknown"
+                log.info(f"  ✅ cTrader order placed! ID: {order_id}")
+                send_telegram(
+                    f"✅ <b>Order Executed on cTrader</b>\n\n"
+                    f"💹 {signal['symbol']} {signal['direction']}\n"
+                    f"📦 {lots} lots @ ${entry:,.4f}\n"
+                    f"🎯 TP: ${signal['tp']:,.4f}  🛑 SL: ${signal['sl']:,.4f}\n"
+                    f"🆔 Order ID: {order_id}"
+                )
+                return True
+
+            # Order rejected (fix #3)
+            log.error(f"  ❌ cTrader order rejected: {r.status_code} — {r.text}")
+            send_telegram(
+                f"❌ <b>cTrader Order Rejected</b>\n\n"
+                f"Pair: {signal['symbol']} {signal['direction']}\n"
+                f"Status: {r.status_code}\n"
+                f"Reason: {r.text[:200]}"
+            )
+            return False
+
+        except Exception as e:
+            log.error(f"  cTrader order error (attempt {attempt+1}): {e}")
+            if attempt == 1:
+                send_telegram(f"❌ <b>cTrader connection error</b> — {signal['symbol']} NOT executed: {e}")
+    return False
+
+# ─── DATA FETCHING + BINANCE FALLBACK ─────────────────────────────────────────
 
 def fetch_kraken(symbol: str, interval: int, limit: int) -> list[dict]:
     try:
@@ -140,7 +288,6 @@ def fetch_kraken(symbol: str, interval: int, limit: int) -> list[dict]:
         return []
 
 def fetch_binance_fallback(kraken_sym: str, limit: int) -> list[dict]:
-    """Fallback to Binance public API if Kraken fails (fix #5)."""
     binance_sym = BINANCE_SYMBOLS.get(kraken_sym)
     if not binance_sym:
         return []
@@ -168,7 +315,6 @@ def fetch_binance_fallback(kraken_sym: str, limit: int) -> list[dict]:
         return []
 
 def fetch_candles(kraken_sym: str, interval: int, limit: int) -> list[dict]:
-    """Try Kraken first, fall back to Binance if empty (fix #5)."""
     candles = fetch_kraken(kraken_sym, interval, limit)
     if not candles:
         log.warning(f"  Kraken failed for {kraken_sym} — trying Binance fallback")
@@ -191,7 +337,6 @@ def fetch_price(symbol: str) -> float | None:
         pair_key = list(result.keys())[0]
         return float(result[pair_key]["c"][0])
     except Exception:
-        # Fallback price from Binance
         try:
             binance_sym = BINANCE_SYMBOLS.get(symbol)
             if binance_sym:
@@ -205,10 +350,9 @@ def fetch_price(symbol: str) -> float | None:
             pass
         return None
 
-# ─── TELEGRAM WITH RETRY (fix #7) ────────────────────────────────────────────
+# ─── TELEGRAM WITH RETRY ──────────────────────────────────────────────────────
 
 def send_telegram(text: str, retries: int = 3) -> bool:
-    """Send Telegram message with up to 3 retries (fix #7)."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured")
         print(text)
@@ -226,31 +370,24 @@ def send_telegram(text: str, retries: int = 3) -> bool:
         except Exception as e:
             log.warning(f"Telegram attempt {attempt+1} error: {e}")
         if attempt < retries - 1:
-            time.sleep(5)  # wait 5s between retries
+            time.sleep(5)
     log.error("Telegram failed after all retries")
     return False
 
-# ─── POSITION SIZE SAFETY CHECK (fix #2) ─────────────────────────────────────
+# ─── POSITION SIZE SAFETY CHECK ───────────────────────────────────────────────
 
 def safe_lot_size(entry: float, sl: float, account_balance: float, risk_pct: float) -> float:
-    """
-    Calculate lot size with hard safety cap.
-    Never risks more than MAX_RISK_PCT regardless of input (fix #2).
-    """
-    risk_pct    = min(risk_pct, MAX_RISK_PCT)  # hard cap
+    risk_pct    = min(risk_pct, MAX_RISK_PCT)
     risk_amount = account_balance * (risk_pct / 100)
     sl_dist     = abs(entry - sl)
     if sl_dist <= 0:
         return 0.01
     lots = risk_amount / sl_dist
     lots = max(0.01, round(lots, 2))
-
-    # Sanity check — if lots implies >2% risk something is wrong
     implied_risk = lots * sl_dist / account_balance * 100
     if implied_risk > MAX_RISK_PCT:
         log.warning(f"  ⚠️ Position size sanity check failed — capping to safe size")
         lots = round((account_balance * MAX_RISK_PCT / 100) / sl_dist, 2)
-
     return lots
 
 # ─── INDICATORS ───────────────────────────────────────────────────────────────
@@ -344,7 +481,7 @@ def find_active_order_blocks(candles: list[dict]) -> list[dict]:
 def analyse(candles: list[dict], name: str) -> dict | None:
     if len(candles) < SWING_LOOKBACK * 4 + 10:
         return None
-    confirm = candles[-2]  # always last CLOSED candle (fix #10)
+    confirm = candles[-2]
     price   = confirm["close"]
     obs = find_active_order_blocks(candles)
     if not obs: return None
@@ -431,7 +568,14 @@ def open_trade(signal: dict, kraken_sym: str) -> None:
     }
     log.info(f"  📌 Tracking {name} {signal['direction']} "
              f"entry=${signal['entry']:,.4f} TP=${signal['tp']:,.4f} SL=${signal['sl']:,.4f}")
-    save_trades()  # persist to disk immediately
+    save_trades()
+
+    # AUTO EXECUTE on cTrader
+    if CTRADER_ACCESS_TOKEN and CTRADER_ACCOUNT_ID:
+        log.info(f"  🤖 Auto-executing on cTrader...")
+        place_ctrader_order(signal)
+    else:
+        log.info(f"  ℹ️ cTrader not configured — signal only")
 
 def check_outcome(name: str, price: float) -> str | None:
     t = active_trades.get(name)
@@ -478,12 +622,9 @@ def close_trade(name: str, outcome: str) -> None:
         "time": datetime.now(timezone.utc),
     })
     del active_trades[name]
-    save_trades()  # update disk after closing
-
-# ─── DUPLICATE TRADE CHECK (fix #4) ──────────────────────────────────────────
+    save_trades()
 
 def already_in_trade(name: str) -> bool:
-    """Check if we already have an active trade for this pair (fix #4)."""
     if name in active_trades:
         log.info(f"  ⛔ {name} already has an active trade — skipping duplicate")
         return True
@@ -562,8 +703,10 @@ def format_signal(sig: dict) -> str:
     e200    = sig.get("ema200", 0); rsi_v = sig.get("rsi"); vol = sig.get("vol_mult", 1.0)
     tp_pct  = (tp - entry) / entry * 100
     sl_pct  = (sl - entry) / entry * 100
+    auto_tag = "🤖 <b>AUTO-EXECUTING on cTrader</b>" if CTRADER_ACCESS_TOKEN else "📡 <b>Signal only (no auto execution)</b>"
     lines = [
         f"{arrow} <b>{sig['symbol']} {sig['direction']} SIGNAL</b>",
+        f"", auto_tag,
         f"", f"📊 <b>Strategy:</b>  {sig['strategy']}",
         f"🕐 <b>Time:</b>      {now_str}", f"",
         f"📦 <b>Order Block:</b>  ${ob_l:,.4f} – ${ob_h:,.4f}",
@@ -594,20 +737,20 @@ def keep_alive() -> None:
         wins  = sum(1 for t in trade_history if t["outcome"] == "TP")
         total = len(trade_history)
         wr    = f"{wins/total*100:.1f}%" if total else "—"
+        ct_status = "✅ Connected" if CTRADER_ACCESS_TOKEN else "⚠️ Not configured"
         return (
-            f"<b>BOS + Order Block Signal Bot — Safety Hardened</b><br><br>"
+            f"<b>BOS + Order Block Signal Bot — Auto Execution</b><br><br>"
             f"<b>Pairs:</b> {len(SYMBOLS)} | <b>Timeframe:</b> 4H | <b>Exchange:</b> Kraken (+ Binance fallback)<br>"
             f"<b>Active trades:</b> {active_str}<br>"
-            f"<b>Completed:</b> {total} trades | <b>Live WR:</b> {wr}<br><br>"
+            f"<b>Completed:</b> {total} trades | <b>Live WR:</b> {wr}<br>"
+            f"<b>cTrader:</b> {ct_status} | Account: {CTRADER_ACCOUNT_ID}<br><br>"
             f"<b>Safety features:</b><br>"
-            f"  ✅ Binance fallback if Kraken fails<br>"
-            f"  ✅ Telegram 3x retry on failure<br>"
+            f"  ✅ Auto execution via cTrader Open API<br>"
+            f"  ✅ Token auto-refresh on 401<br>"
+            f"  ✅ Balance check before every order<br>"
+            f"  ✅ Order rejection alerts to Telegram<br>"
             f"  ✅ Hard cap: max {MAX_RISK_PCT}% risk per trade<br>"
             f"  ✅ Duplicate trade prevention<br>"
-            f"  ✅ Always uses last closed candle<br><br>"
-            f"<b>Strategy params:</b><br>"
-            f"  Swing lookback: {SWING_LOOKBACK} bars | OB expiry: {OB_EXPIRE_BARS} bars<br>"
-            f"  SL buffer: {OB_BUFFER_PCT*100:.0f}% | R:R: {RR_TARGET}:1 | Cooldown: {COOLDOWN_PER_PAIR//3600}h<br>"
         )
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))),
            daemon=True).start()
@@ -616,17 +759,19 @@ def keep_alive() -> None:
 
 def run() -> None:
     log.info("═" * 64)
-    log.info("  BOS + Order Block Signal Bot — Safety Hardened")
+    log.info("  BOS + Order Block Signal Bot — Auto Execution")
     log.info(f"  {len(SYMBOLS)} pairs | 4H | Kraken + Binance fallback")
-    log.info(f"  Max risk: {MAX_RISK_PCT}% | Telegram retries: 3 | Duplicate check: ON")
-    log.info(f"  Backtest: ~50–54% WR | 28/28 profitable years")
+    log.info(f"  cTrader account: {CTRADER_ACCOUNT_ID or 'NOT SET'}")
+    log.info(f"  Max risk: {MAX_RISK_PCT}% | Risk per trade: {RISK_PCT}%")
     log.info("═" * 64)
 
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_TOKEN not set — signals print to console only")
+    if not CTRADER_ACCESS_TOKEN:
+        log.warning("CTRADER_ACCESS_TOKEN not set — signals only, no auto execution")
 
     keep_alive()
-    load_trades()  # restore any trades that were open before restart
+    load_trades()
 
     last_alert:  dict[str, float] = {name: 0.0 for _, name in SYMBOLS}
     symbol_data: dict = {}
@@ -649,7 +794,6 @@ def run() -> None:
 
             for kraken_sym, name in SYMBOLS:
                 try:
-                    # Outcome check
                     if name in active_trades:
                         price = fetch_price(kraken_sym)
                         if price is not None:
@@ -660,13 +804,11 @@ def run() -> None:
                                 close_trade(name, outcome)
                                 last_alert[name] = now - COOLDOWN_PER_PAIR + 600
 
-                    # Skip if active trade or cooldown (fix #4)
                     if already_in_trade(name):
                         continue
                     if now - last_alert.get(name, 0) < COOLDOWN_PER_PAIR:
                         continue
 
-                    # Refresh candles using safe fetch with fallback (fix #5)
                     new_candles = fetch_candles(kraken_sym, INTERVAL_4H, 5)
                     buf = symbol_data[kraken_sym]["candles"]
                     for c in new_candles:
@@ -680,8 +822,8 @@ def run() -> None:
                         log.info(f"  🎯 {name} {sig['direction']} | "
                                  f"OB ${sig['ob_low']:,.4f}–${sig['ob_high']:,.4f} | "
                                  f"entry ${sig['entry']:,.4f} | conf {sig['confidence']}%")
-                        send_telegram(format_signal(sig))  # 3x retry built in
-                        open_trade(sig, kraken_sym)
+                        send_telegram(format_signal(sig))
+                        open_trade(sig, kraken_sym)  # auto execution happens inside here
                         last_alert[name] = now
 
                     time.sleep(0.3)
