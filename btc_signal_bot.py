@@ -680,6 +680,46 @@ def keep_alive() -> None:
             f"  ✅ Hard cap: max {MAX_RISK_PCT}% risk per trade<br>"
             f"  ✅ Duplicate trade prevention<br>"
         )
+    @app.route("/callback")
+    def callback():
+        global CTRADER_ACCESS_TOKEN, CTRADER_REFRESH_TOKEN
+        from flask import request
+        code = request.args.get("code")
+        if not code:
+            return "No code received", 400
+        try:
+            r = requests.post(
+                "https://connect.spotware.com/apps/token",
+                data={
+                    "grant_type": "authorization_code",
+                    "code": code,
+                    "redirect_uri": f"https://btc-signal-bot-production-3d02.up.railway.app/callback",
+                    "client_id": CTRADER_CLIENT_ID,
+                    "client_secret": CTRADER_CLIENT_SECRET,
+                },
+                timeout=15,
+            )
+            data = r.json()
+            access = data.get("accessToken") or data.get("access_token")
+            refresh = data.get("refreshToken") or data.get("refresh_token")
+            if access:
+                CTRADER_ACCESS_TOKEN = access
+                CTRADER_REFRESH_TOKEN = refresh or CTRADER_REFRESH_TOKEN
+                log.info(f"  ✅ Production token received via callback!")
+                send_telegram(f"✅ <b>cTrader production token received!</b>\nBot is now authorised for live account {CTRADER_ACCOUNT_ID}.\n\nUpdate CTRADER_ACCESS_TOKEN in Railway:\n<code>{access}</code>")
+                return f"<h2>✅ Authorised!</h2><p>Token received. Update CTRADER_ACCESS_TOKEN in Railway with:</p><code>{access}</code><br><br><p>Refresh token: <code>{refresh}</code></p>"
+            return f"Token exchange failed: {data}", 400
+        except Exception as e:
+            return f"Error: {e}", 500
+
+    @app.route("/auth")
+    def auth():
+        url = (f"https://connect.spotware.com/apps/auth"
+               f"?client_id={CTRADER_CLIENT_ID}"
+               f"&redirect_uri=https://btc-signal-bot-production-3d02.up.railway.app/callback"
+               f"&response_type=code&scope=trading")
+        return f'<h2>cTrader Auth</h2><a href="{url}">Click here to authorize</a>'
+
     Thread(target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080))),
            daemon=True).start()
 
