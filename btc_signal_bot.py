@@ -108,68 +108,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("BOSBot")
 
-# ─── cTRADER AUTO EXECUTION ───────────────────────────────────────────────────
-
-def refresh_ctrader_token() -> bool:
-    """Refresh the access token using the refresh token (fix #1)."""
-    global CTRADER_ACCESS_TOKEN
-    if not CTRADER_REFRESH_TOKEN or not CTRADER_CLIENT_ID or not CTRADER_CLIENT_SECRET:
-        log.warning("cTrader refresh credentials not set")
-        return False
-    try:
-        r = requests.post(
-            "https://connect.spotware.com/apps/token",
-            data={
-                "grant_type": "refresh_token",
-                "refresh_token": CTRADER_REFRESH_TOKEN,
-                "client_id": CTRADER_CLIENT_ID,
-                "client_secret": CTRADER_CLIENT_SECRET,
-            },
-            timeout=15,
-        )
-        data = r.json()
-        new_token = data.get("accessToken") or data.get("access_token")
-        if new_token:
-            CTRADER_ACCESS_TOKEN = new_token
-            log.info("  ✅ cTrader access token refreshed")
-            return True
-        log.error(f"  Token refresh failed: {data}")
-        return False
-    except Exception as e:
-        log.error(f"  Token refresh error: {e}")
-        return False
-
-def get_account_balance() -> float | None:
-    """Fetch account balance from cTrader."""
-    global CTRADER_ACCESS_TOKEN
-    if not CTRADER_ACCESS_TOKEN or not CTRADER_ACCOUNT_ID:
-        return None
-    for attempt in range(2):
-        try:
-            r = requests.get(
-                f"https://api.spotware.com/connect/tradingaccounts/{CTRADER_ACCOUNT_ID}",
-                headers={"Authorization": f"Bearer {CTRADER_ACCESS_TOKEN}"},
-                timeout=15,
-            )
-            if r.status_code == 401:
-                if attempt == 0 and refresh_ctrader_token():
-                    continue
-                return None
-            data = r.json()
-            balance = data.get("balance") or data.get("Balance")
-            if balance is not None:
-                return float(balance) / 100  # cTrader returns balance in cents
-        except Exception as e:
-            log.error(f"  Balance fetch error: {e}")
-    return None
+# ─── cTRADER AUTO EXECUTION (via ctrader-sdk) ────────────────────────────────
 
 def place_ctrader_order(signal: dict) -> bool:
-    """
-    Place a market order on cTrader with SL and TP.
-    Returns True if order placed successfully.
-    """
-    global CTRADER_ACCESS_TOKEN
-
+    """Place a market order on cTrader using ctrader-sdk."""
     if not CTRADER_ACCESS_TOKEN or not CTRADER_ACCOUNT_ID:
         log.warning("  ⚠️ cTrader not configured — signal sent to Telegram only")
         return False
@@ -179,82 +121,68 @@ def place_ctrader_order(signal: dict) -> bool:
         log.warning(f"  ⚠️ No cTrader symbol mapping for {signal['symbol']}")
         return False
 
-    # Get account balance for position sizing (fix #8)
-    balance = get_account_balance()
-    if balance is None:
-        log.warning("  ⚠️ Could not fetch balance — skipping auto execution")
-        send_telegram(f"⚠️ <b>cTrader balance fetch failed</b> — {signal['symbol']} signal sent but NOT auto-executed")
-        return False
+    try:
+        from ctrader_sdk import CTraderBot
+        bot = CTraderBot(CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID)
 
-    log.info(f"  💰 Account balance: ${balance:,.2f}")
+        # Get balance for position sizing
+        account_info = bot.get_account_information()
+        balance = None
+        if account_info:
+            balance = account_info.get("balance") or account_info.get("equity")
+            if balance:
+                balance = float(balance) / 100  # cTrader returns in cents
 
-    # Calculate position size
-    entry = signal["entry"]
-    sl    = signal["sl"]
-    lots  = safe_lot_size(entry, sl, balance, RISK_PCT)
+        if not balance:
+            equity = bot.get_account_equity()
+            if equity:
+                balance = float(equity)
 
-    trade_side = "BUY" if signal["direction"] == "LONG" else "SELL"
-
-    # Build order payload
-    payload = {
-        "symbolName": ct_symbol,
-        "tradeSide": trade_side,
-        "volume": int(lots * 100),  # cTrader uses units (lots * 100)
-        "orderType": "MARKET",
-        "stopLoss": round(sl, 5),
-        "takeProfit": round(signal["tp"], 5),
-        "comment": f"BOS+OB Bot | {signal['strategy'][:20]}",
-    }
-
-    log.info(f"  📤 Placing cTrader order: {trade_side} {ct_symbol} {lots} lots | SL={sl:.4f} TP={signal['tp']:.4f}")
-
-    for attempt in range(2):
-        try:
-            r = requests.post(
-                f"https://api.spotware.com/connect/tradingaccounts/{CTRADER_ACCOUNT_ID}/orders",
-                headers={
-                    "Authorization": f"Bearer {CTRADER_ACCESS_TOKEN}",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=15,
-            )
-
-            if r.status_code == 401:
-                if attempt == 0 and refresh_ctrader_token():
-                    continue
-                log.error("  ❌ cTrader auth failed after token refresh")
-                send_telegram(f"❌ <b>cTrader auth failed</b> — {signal['symbol']} NOT executed. Token may need renewal.")
-                return False
-
-            if r.status_code in (200, 201):
-                order_data = r.json()
-                order_id   = order_data.get("orderId") or order_data.get("id") or "unknown"
-                log.info(f"  ✅ cTrader order placed! ID: {order_id}")
-                send_telegram(
-                    f"✅ <b>Order Executed on cTrader</b>\n\n"
-                    f"💹 {signal['symbol']} {signal['direction']}\n"
-                    f"📦 {lots} lots @ ${entry:,.4f}\n"
-                    f"🎯 TP: ${signal['tp']:,.4f}  🛑 SL: ${signal['sl']:,.4f}\n"
-                    f"🆔 Order ID: {order_id}"
-                )
-                return True
-
-            # Order rejected (fix #3)
-            log.error(f"  ❌ cTrader order rejected: {r.status_code} — {r.text}")
-            send_telegram(
-                f"❌ <b>cTrader Order Rejected</b>\n\n"
-                f"Pair: {signal['symbol']} {signal['direction']}\n"
-                f"Status: {r.status_code}\n"
-                f"Reason: {r.text[:200]}"
-            )
+        if not balance:
+            log.warning("  ⚠️ Could not fetch balance — skipping auto execution")
+            send_telegram(f"⚠️ <b>cTrader balance fetch failed</b> — {signal['symbol']} signal sent but NOT auto-executed")
             return False
 
-        except Exception as e:
-            log.error(f"  cTrader order error (attempt {attempt+1}): {e}")
-            if attempt == 1:
-                send_telegram(f"❌ <b>cTrader connection error</b> — {signal['symbol']} NOT executed: {e}")
-    return False
+        log.info(f"  💰 Account balance: ${balance:,.2f}")
+
+        entry = signal["entry"]
+        sl    = signal["sl"]
+        lots  = safe_lot_size(entry, sl, balance, RISK_PCT)
+        volume = int(lots * 100000)  # ctrader-sdk uses full units
+
+        trade_side = "BUY" if signal["direction"] == "LONG" else "SELL"
+
+        log.info(f"  📤 Placing order: {trade_side} {ct_symbol} vol={volume} SL={sl:.4f} TP={signal['tp']:.4f}")
+
+        order_response = bot.place_order(
+            symbol=ct_symbol,
+            volume=volume,
+            direction=trade_side,
+            order_type="MARKET",
+            take_profit=round(signal["tp"], 5),
+            stop_loss=round(sl, 5),
+        )
+
+        if order_response:
+            order_id = order_response.get("orderId") or order_response.get("id") or "unknown"
+            log.info(f"  ✅ Order placed! ID: {order_id}")
+            send_telegram(
+                f"✅ <b>Order Executed on cTrader</b>\n\n"
+                f"💹 {signal['symbol']} {signal['direction']}\n"
+                f"📦 {lots} lots @ ${entry:,.4f}\n"
+                f"🎯 TP: ${signal['tp']:,.4f}  🛑 SL: ${sl:,.4f}\n"
+                f"🆔 Order ID: {order_id}"
+            )
+            return True
+        else:
+            log.error("  ❌ Order placement returned no response")
+            send_telegram(f"❌ <b>cTrader Order Failed</b> — {signal['symbol']} {signal['direction']} — no response from API")
+            return False
+
+    except Exception as e:
+        log.error(f"  ❌ cTrader execution error: {e}")
+        send_telegram(f"❌ <b>cTrader error</b> — {signal['symbol']} NOT executed: {str(e)[:200]}")
+        return False
 
 # ─── DATA FETCHING + BINANCE FALLBACK ─────────────────────────────────────────
 
