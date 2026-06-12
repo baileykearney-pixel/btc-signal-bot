@@ -6,7 +6,8 @@ from urllib.parse import quote
 
 app = Flask("")
 
-RAILWAY_URL = os.environ.get("APP_URL", "https://btc-signal-bot-production-3d02.up.railway.app")
+AUTH_URL = "https://openapi.ctrader.com/apps/auth"
+TOKEN_URL = "https://openapi.ctrader.com/apps/token"
 
 
 @app.route("/")
@@ -17,13 +18,8 @@ def home():
 @app.route("/auth")
 def auth():
     cid = os.environ.get("CTRADER_CLIENT_ID", "")
-    cb = RAILWAY_URL + "/callback"
-    url = (
-        "openapi.ctrader.com/apps/token"
-        "?client_id=" + cid +
-        "&redirect_uri=" + cb +
-        "&response_type=code&scope=trading"
-    )
+    cb = os.environ.get("APP_URL", "https://btc-signal-bot-production-3d02.up.railway.app") + "/callback"
+    url = AUTH_URL + "?client_id=" + cid + "&redirect_uri=" + cb + "&response_type=code&scope=trading"
     return "<h2>cTrader Auth</h2><a href='" + url + "'>Click here to authorize</a>"
 
 
@@ -34,18 +30,18 @@ def callback():
         return "No code received", 400
     cid = os.environ.get("CTRADER_CLIENT_ID", "")
     csec = os.environ.get("CTRADER_CLIENT_SECRET", "")
-    cb = RAILWAY_URL + "/callback"
+    cb = os.environ.get("APP_URL", "https://btc-signal-bot-production-3d02.up.railway.app") + "/callback"
+    print("DEBUG cid=" + repr(cid) + " csec_len=" + str(len(csec)) + " cb=" + cb, flush=True)
     try:
-        print(f"DEBUG cid={repr(cid)} csec_len={len(csec)} cb={cb}", flush=True)
         body = (
             "grant_type=authorization_code"
-            "&code=" + quote(code, safe='') +
-            "&redirect_uri=" + quote(cb, safe='') +
-            "&client_id=" + quote(cid, safe='') +
-            "&client_secret=" + quote(csec, safe='')
+            "&code=" + quote(code, safe="") +
+            "&redirect_uri=" + quote(cb, safe="") +
+            "&client_id=" + quote(cid, safe="") +
+            "&client_secret=" + quote(csec, safe="")
         )
         r = requests.post(
-            ""https://openapi.ctrader.com/apps/auth"",
+            TOKEN_URL,
             data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
@@ -54,11 +50,10 @@ def callback():
         access = data.get("accessToken") or data.get("access_token")
         refresh = data.get("refreshToken") or data.get("refresh_token")
         if access:
-            import logging
-            logging.getLogger("keep_alive").info("FULL ACCESS TOKEN: " + access)
-            logging.getLogger("keep_alive").info("FULL REFRESH TOKEN: " + str(refresh))
+            print("FULL ACCESS TOKEN: " + access, flush=True)
+            print("FULL REFRESH TOKEN: " + str(refresh), flush=True)
             return "<h2>Authorised!</h2><p>Copy tokens from Railway Deploy Logs.</p>"
-        return "Failed: " + str(data), 400
+        return "Token exchange failed: " + str(data), 400
     except Exception as e:
         return "Error: " + str(e), 500
 
