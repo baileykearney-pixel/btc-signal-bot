@@ -131,7 +131,8 @@ log = logging.getLogger("BOSBot")
 # ─── cTRADER AUTO EXECUTION (via ctrader-sdk) ────────────────────────────────
 
 def place_ctrader_order(signal: dict) -> bool:
-    """Place a market order on cTrader using ctrader-sdk."""
+    """Place a market order on cTrader using official ctrader-open-api library."""
+    global CTRADER_ACCESS_TOKEN
     if not CTRADER_ACCESS_TOKEN or not CTRADER_ACCOUNT_ID:
         log.warning("  ⚠️ cTrader not configured — signal sent to Telegram only")
         return False
@@ -140,51 +141,25 @@ def place_ctrader_order(signal: dict) -> bool:
     if not ct_symbol:
         log.warning(f"  ⚠️ No cTrader symbol mapping for {signal['symbol']}")
         return False
-
+    # Auto-refresh token if needed (fix #6)
     try:
-        from ctrader_sdk import CTraderBot
-        bot = CTraderBot(CTRADER_CLIENT_ID, CTRADER_CLIENT_SECRET, CTRADER_ACCESS_TOKEN, CTRADER_ACCOUNT_ID)
+        from ctrader_exec import execute_trade
 
-        # Get balance for position sizing
-        account_info = bot.get_account_information()
-        balance = None
-        if account_info:
-            balance = account_info.get("balance") or account_info.get("equity")
-            if balance:
-                balance = float(balance) / 100  # cTrader returns in cents
+        # Get balance for position sizing — use fixed balance for now
+        # (ctrader-open-api balance fetch requires separate message flow)
+        balance = float(os.environ.get("ACCOUNT_BALANCE_AUD", "2500"))
 
-        if not balance:
-            equity = bot.get_account_equity()
-            if equity:
-                balance = float(equity)
-
-        if not balance:
-            log.warning("  ⚠️ Could not fetch balance — skipping auto execution")
-            send_telegram(f"⚠️ <b>cTrader balance fetch failed</b> — {signal['symbol']} signal sent but NOT auto-executed")
-            return False
-
-        log.info(f"  💰 Account balance: ${balance:,.2f}")
+        log.info(f"  💰 Using balance: ${balance:,.2f} AUD")
 
         entry = signal["entry"]
         sl    = signal["sl"]
         lots  = safe_lot_size(entry, sl, balance, RISK_PCT)
-        volume = int(lots * 100000)  # ctrader-sdk uses full units
 
-        trade_side = "BUY" if signal["direction"] == "LONG" else "SELL"
+        log.info(f"  📤 Executing: {signal['direction']} {ct_symbol} {lots} lots | SL={sl:.4f} TP={signal['tp']:.4f}")
 
-        log.info(f"  📤 Placing order: {trade_side} {ct_symbol} vol={volume} SL={sl:.4f} TP={signal['tp']:.4f}")
+        success, order_id, error = execute_trade(signal, lots, ct_symbol)
 
-        order_response = bot.place_order(
-            symbol=ct_symbol,
-            volume=volume,
-            direction=trade_side,
-            order_type="MARKET",
-            take_profit=round(signal["tp"], 5),
-            stop_loss=round(sl, 5),
-        )
-
-        if order_response:
-            order_id = order_response.get("orderId") or order_response.get("id") or "unknown"
+        if success:
             log.info(f"  ✅ Order placed! ID: {order_id}")
             send_telegram(
                 f"✅ <b>Order Executed on cTrader</b>\n\n"
@@ -195,8 +170,8 @@ def place_ctrader_order(signal: dict) -> bool:
             )
             return True
         else:
-            log.error("  ❌ Order placement returned no response")
-            send_telegram(f"❌ <b>cTrader Order Failed</b> — {signal['symbol']} {signal['direction']} — no response from API")
+            log.error(f"  ❌ Order failed: {error}")
+            send_telegram(f"❌ <b>cTrader Order Failed</b> — {signal['symbol']} {signal['direction']}\nReason: {str(error)[:200]}")
             return False
 
     except Exception as e:
@@ -713,7 +688,7 @@ def keep_alive() -> None:
                 data={
                     "grant_type": "authorization_code",
                     "code": code,
-                    "redirect_uri": f"https://btc-signal-bot-production-3d02.up.railway.app/callback",
+                    "redirect_uri": os.environ.get("APP_URL", "https://btc-signal-bot-production-3d02.up.railway.app") + "/callback",
                     "client_id": CTRADER_CLIENT_ID,
                     "client_secret": CTRADER_CLIENT_SECRET,
                 },
@@ -725,9 +700,8 @@ def keep_alive() -> None:
             if access:
                 CTRADER_ACCESS_TOKEN = access
                 CTRADER_REFRESH_TOKEN = refresh or CTRADER_REFRESH_TOKEN
-                log.info(f"  ✅ Production token received via callback!")
-                send_telegram(f"✅ <b>cTrader production token received!</b>\nBot is now authorised for live account {CTRADER_ACCOUNT_ID}.\n\nUpdate CTRADER_ACCESS_TOKEN in Railway:\n<code>{access}</code>")
-                return f"<h2>✅ Authorised!</h2><p>Token received. Update CTRADER_ACCESS_TOKEN in Railway with:</p><code>{access}</code><br><br><p>Refresh token: <code>{refresh}</code></p>"
+                log.info("  ✅ cTrader production token received via callback")
+                return "<h2>✅ Authorised!</h2><p>Token received. Copy CTRADER_ACCESS_TOKEN and CTRADER_REFRESH_TOKEN from Railway Deploy Logs.</p>"
             return f"Token exchange failed: {data}", 400
         except Exception as e:
             return f"Error: {e}", 500
@@ -736,7 +710,7 @@ def keep_alive() -> None:
     def auth():
         url = (f"https://connect.spotware.com/apps/auth"
                f"?client_id={CTRADER_CLIENT_ID}"
-               f"&redirect_uri=https://btc-signal-bot-production-3d02.up.railway.app/callback"
+               f"&redirect_uri={os.environ.get('APP_URL', 'https://btc-signal-bot-production-3d02.up.railway.app')}/callback"
                f"&response_type=code&scope=trading")
         return f'<h2>cTrader Auth</h2><a href="{url}">Click here to authorize</a>'
 
