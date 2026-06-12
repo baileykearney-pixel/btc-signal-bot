@@ -14,6 +14,26 @@ import requests
 
 # ─── TRADE PERSISTENCE ────────────────────────────────────────────────────────
 TRADES_FILE = "/tmp/active_trades.json"
+ALERTS_FILE = "/tmp/last_alerts.json"
+
+def save_alerts(last_alert):
+    try:
+        with open(ALERTS_FILE, "w") as f:
+            import json as _j; _j.dump(last_alert, f)
+    except Exception as e:
+        log.warning(f"Could not save alerts: {e}")
+
+def load_alerts(last_alert):
+    try:
+        import os as _os
+        if not _os.path.exists(ALERTS_FILE): return
+        with open(ALERTS_FILE) as f:
+            import json as _j; data = _j.load(f)
+        for k, v in data.items():
+            if k in last_alert: last_alert[k] = float(v)
+        log.info("  Restored last_alert timestamps — no duplicate signals on restart")
+    except Exception as e:
+        log.warning(f"Could not load alerts: {e}")
 
 def save_trades():
     try:
@@ -740,6 +760,7 @@ def run() -> None:
 
     keep_alive()
     load_trades()
+    load_alerts(last_alert)
 
     last_alert:  dict[str, float] = {name: 0.0 for _, name in SYMBOLS}
     symbol_data: dict = {}
@@ -771,6 +792,7 @@ def run() -> None:
                                 send_telegram(format_outcome(name, outcome))
                                 close_trade(name, outcome)
                                 last_alert[name] = now - COOLDOWN_PER_PAIR + 600
+                                save_alerts(last_alert)
 
                     if already_in_trade(name):
                         continue
@@ -793,6 +815,7 @@ def run() -> None:
                         send_telegram(format_signal(sig))
                         open_trade(sig, kraken_sym)  # auto execution happens inside here
                         last_alert[name] = now
+                        save_alerts(last_alert)
 
                     time.sleep(0.3)
 
