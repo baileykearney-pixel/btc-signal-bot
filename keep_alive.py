@@ -45,7 +45,7 @@ def callback():
             "&client_secret=" + quote(csec, safe='')
         )
         r = requests.post(
-            "https://connect.spotware.com/apps/token",
+            ""https://openapi.ctrader.com/apps/auth"",
             data=body,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
