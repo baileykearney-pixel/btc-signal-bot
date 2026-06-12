@@ -19,7 +19,7 @@ def auth():
     cid = os.environ.get("CTRADER_CLIENT_ID", "")
     cb = RAILWAY_URL + "/callback"
     url = (
-        "https://connect.spotware.com/apps/auth"
+        "openapi.ctrader.com/apps/token"
         "?client_id=" + cid +
         "&redirect_uri=" + cb +
         "&response_type=code&scope=trading"
