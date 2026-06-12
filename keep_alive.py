@@ -2,10 +2,11 @@ from flask import Flask, request
 from threading import Thread
 import os
 import requests
+from urllib.parse import quote
 
 app = Flask("")
 
-RAILWAY_URL = "https://btc-signal-bot-production-3d02.up.railway.app"
+RAILWAY_URL = os.environ.get("APP_URL", "https://btc-signal-bot-production-3d02.up.railway.app")
 
 
 @app.route("/")
@@ -17,8 +18,12 @@ def home():
 def auth():
     cid = os.environ.get("CTRADER_CLIENT_ID", "")
     cb = RAILWAY_URL + "/callback"
-    base = "https://connect.spotware.com/apps/auth"
-    url = base + "?client_id=" + cid + "&redirect_uri=" + cb + "&response_type=code&scope=trading"
+    url = (
+        "https://connect.spotware.com/apps/auth"
+        "?client_id=" + cid +
+        "&redirect_uri=" + cb +
+        "&response_type=code&scope=trading"
+    )
     return "<h2>cTrader Auth</h2><a href='" + url + "'>Click here to authorize</a>"
 
 
@@ -31,26 +36,27 @@ def callback():
     csec = os.environ.get("CTRADER_CLIENT_SECRET", "")
     cb = RAILWAY_URL + "/callback"
     try:
+        body = (
+            "grant_type=authorization_code"
+            "&code=" + quote(code, safe='') +
+            "&redirect_uri=" + quote(cb, safe='') +
+            "&client_id=" + quote(cid, safe='') +
+            "&client_secret=" + quote(csec, safe='')
+        )
         r = requests.post(
             "https://connect.spotware.com/apps/token",
-            data={
-                "grant_type": "authorization_code",
-                "code": code,
-                "redirect_uri": cb,
-                "client_id": cid,
-                "client_secret": csec,
-            },
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=15,
         )
         data = r.json()
         access = data.get("accessToken") or data.get("access_token")
         refresh = data.get("refreshToken") or data.get("refresh_token")
         if access:
-            html = "<h2>Authorised!</h2>"
-            html += "<p>Add these to Railway Variables:</p>"
-            html += "<b>CTRADER_ACCESS_TOKEN:</b><br><code>" + access + "</code><br><br>"
-            html += "<b>CTRADER_REFRESH_TOKEN:</b><br><code>" + str(refresh) + "</code>"
-            return html
+            import logging
+            logging.getLogger("keep_alive").info("FULL ACCESS TOKEN: " + access)
+            logging.getLogger("keep_alive").info("FULL REFRESH TOKEN: " + str(refresh))
+            return "<h2>Authorised!</h2><p>Copy tokens from Railway Deploy Logs.</p>"
         return "Failed: " + str(data), 400
     except Exception as e:
         return "Error: " + str(e), 500
