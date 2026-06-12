@@ -760,9 +760,9 @@ def run() -> None:
 
     keep_alive()
     load_trades()
-    load_alerts(last_alert)
 
     last_alert:  dict[str, float] = {name: 0.0 for _, name in SYMBOLS}
+    load_alerts(last_alert)
     symbol_data: dict = {}
 
     for kraken_sym, name in SYMBOLS:
