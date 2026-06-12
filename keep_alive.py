@@ -36,6 +36,7 @@ def callback():
     csec = os.environ.get("CTRADER_CLIENT_SECRET", "")
     cb = RAILWAY_URL + "/callback"
     try:
+        print(f"DEBUG cid={repr(cid)} csec_len={len(csec)} cb={cb}", flush=True)
         body = (
             "grant_type=authorization_code"
             "&code=" + quote(code, safe='') +
